@@ -5,3 +5,5 @@ kvdata/
 *.iml
 .vscode/
 .DS_Store
+docs/plans/
+docs/specs/
