@@ -137,6 +137,28 @@ public final class KvStore implements AutoCloseable {
         }
     }
 
+    /**
+     * Atomic check-and-delete: returns {@code true} if the key existed (and
+     * is now deleted), {@code false} if it was already absent.
+     *
+     * <p>Used by the network DEL command to count keys that actually existed,
+     * without a TOCTOU race against concurrent writers.
+     */
+    public boolean deleteIfPresent(String key) throws IOException {
+        flushLock.lock();
+        try {
+            boolean exists = get(key).isPresent();
+            if (exists) {
+                wal.appendDelete(key);
+                memtable.delete(key);
+                maybeFlush();
+            }
+            return exists;
+        } finally {
+            flushLock.unlock();
+        }
+    }
+
     // =========================================================================
     // Read operations
     // =========================================================================

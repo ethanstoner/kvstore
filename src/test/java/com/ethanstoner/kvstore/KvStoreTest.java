@@ -197,4 +197,29 @@ class KvStoreTest {
             assertTrue(store.get("doomed").isEmpty());
         }
     }
+
+    @Test
+    void deleteIfPresentReturnsTrueWhenKeyExists(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("k", "v");
+            assertTrue(store.deleteIfPresent("k"));
+            assertTrue(store.get("k").isEmpty());
+        }
+    }
+
+    @Test
+    void deleteIfPresentReturnsFalseWhenKeyMissing(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            assertFalse(store.deleteIfPresent("nope"));
+        }
+    }
+
+    @Test
+    void deleteIfPresentReturnsFalseForAlreadyDeletedKey(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("k", "v");
+            store.delete("k");
+            assertFalse(store.deleteIfPresent("k"));
+        }
+    }
 }
