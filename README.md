@@ -30,46 +30,86 @@ The public API is small. All the engineering is in the internals — and those i
 
 ## Architecture
 
+### High-level
+
 ```
-   ┌──────────────────────────────────────────────────────────┐
-   │  redis-cli / redis-py / Jedis / any RESP client          │
-   └────────────────────┬─────────────────────────────────────┘
-                        │ TCP + RESP protocol
-                        ▼
-   ┌────────────────────────┐
-   │   KvServer             │   accept loop + 1 vthread/conn
-   │   (Java 21 vthreads)   │   RESP parser → command handler
-   └────────────────────────┘
-                        │
-                        ▼
-        put(k, v) / delete(k)
-                │
-                ▼
-   ┌────────────────────────┐   1. append (durable, fsync'd)
-   │   Write-Ahead Log      │
-   │   (append-only file)   │
-   └────────────────────────┘
-                │ replay on startup
-                ▼
-   ┌────────────────────────┐   2. apply (fast, in RAM)
-   │   Memtable             │   ConcurrentSkipListMap
-   │   (sorted, in-memory)  │   — O(log n), keeps keys ordered
-   └────────────────────────┘
-                │ flush when > 4 MB
-                ▼
-   ┌────────────────────────┐   3. immutable sorted runs
-   │   SSTables on disk     │   binary format + bloom filter
-   │   + in-memory index    │   per file for fast lookups
-   └────────────────────────┘
-                │ merge when 4+ same-size
-                ▼
-   ┌────────────────────────┐
-   │   Compacted SSTables   │   k-way merged, tombstones dropped
-   │   (background thread)  │   size-tiered compaction strategy
-   └────────────────────────┘
+  ┌─────────────────────────────────────────────────────────┐
+  │  Clients   redis-cli · redis-py · Jedis · any RESP lib  │
+  └─────────────────────────────┬───────────────────────────┘
+                                │  TCP  (optional TLSv1.3)
+                                │  RESP protocol
+                                ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  Network layer                                          │
+  │                                                         │
+  │    accept loop  ──►  vthread/connection  ──►  RESP I/O  │
+  │    (SSL/plain)       (Java 21)                │         │
+  │                                               ▼         │
+  │                                       AUTH ──► dispatch │
+  │                                       (multi-user)      │
+  └─────────────────────────────┬───────────────────────────┘
+                                │  put / get / delete / scan
+                                ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  Storage engine  (LSM-tree)                             │
+  │                                                         │
+  │    WAL ──► Memtable ──► Immutable ──► SSTables          │
+  │   (CRC32) (skip-list)   memtable    (L0 ─► L1 ─► L2…)   │
+  │                                                         │
+  │  Background:  concurrent flush · leveled compaction     │
+  │  Shared:      LRU block cache · bloom filter per file   │
+  └─────────────────────────────────────────────────────────┘
 ```
 
-Every write is logged to disk **before** it is applied in memory — that ordering is what makes a crash survivable. When the memtable exceeds 4 MB, it is flushed to an immutable SSTable on disk. A background thread merges SSTables of similar size to bound read amplification and reclaim space from deleted keys.
+### Storage engine deep-dive
+
+```
+      put(k,v) / delete(k)
+             │
+             ▼
+  ┌─────────────────────────┐   1. append (durable, fsync'd, CRC32 per record)
+  │  Write-Ahead Log        │      replayed on startup; survives crashes
+  │  wal.log + wal-pending  │
+  └────────────┬────────────┘
+               │ apply
+               ▼
+  ┌─────────────────────────┐   2. in-memory write buffer
+  │  Active Memtable        │      ConcurrentSkipListMap, O(log n)
+  │  (sorted, mutable)      │
+  └────────────┬────────────┘
+               │ atomic swap when > 4 MB
+               ▼
+  ┌─────────────────────────┐   reads still hit this until flush completes
+  │  Immutable Memtable     │   background flush thread writes it to L0
+  │  (sorted, frozen)       │   — concurrent with new writes —
+  └────────────┬────────────┘
+               │ flush
+               ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │  SSTables on disk  (leveled, LevelDB/RocksDB style)     │
+  │                                                         │
+  │   L0:  [ ] [ ] [ ] [ ]    ≤ 4 files, may overlap        │
+  │            │  compact when full                         │
+  │            ▼                                            │
+  │   L1:  [   ][    ][  ]    non-overlapping, ≤ 10 MB      │
+  │            │  compact when over budget                  │
+  │            ▼                                            │
+  │   L2:  [        ][      ] non-overlapping, ≤ 100 MB     │
+  │                           (each level 10× larger)       │
+  │                                                         │
+  │   Per file:  sorted data section · bloom filter ·       │
+  │              in-memory key→offset index · footer        │
+  │   Per value: Deflate-compressed when > 64 bytes         │
+  │   Per read:  FileChannel positional read (no vthread    │
+  │              carrier pinning), then LRU block cache     │
+  └─────────────────────────────────────────────────────────┘
+
+  Read path:  Memtable → Immutable → L0 (all 4) → L1 → L2 → ...
+              stops at the first match (bloom filter skips levels
+              that provably don't contain the key)
+```
+
+Every write is logged to disk **before** it is applied in memory — that ordering is what makes a crash survivable. When the memtable exceeds 4 MB it is atomically swapped to an "immutable" slot and a background thread writes it to an L0 SSTable; new writes continue against a fresh memtable without blocking. Reads check active → immutable → L0 (all files) → L1 (one file, binary search) → L2 (one file) → … with bloom filters skipping levels that can't contain the key. A background thread compacts L_n → L_n+1, dropping tombstones only when they reach the deepest level.
 
 ## Features
 
