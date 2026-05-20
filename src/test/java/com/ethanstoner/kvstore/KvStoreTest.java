@@ -98,4 +98,59 @@ class KvStoreTest {
             assertEquals(Optional.of("x".repeat(100)), reopened.get("key-019999"));
         }
     }
+
+    @Test
+    void getReadsFromSStableAfterFlush(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("early-key", "early-value");
+            String bigValue = "x".repeat(100);
+            for (int i = 0; i < 20_000; i++) {
+                store.put("filler-" + String.format("%06d", i), bigValue);
+            }
+            assertEquals(Optional.of("early-value"), store.get("early-key"));
+        }
+    }
+
+    @Test
+    void deleteInMemtableHidesSStableValue(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("victim", "alive");
+            String bigValue = "x".repeat(100);
+            for (int i = 0; i < 20_000; i++) {
+                store.put("pad-" + String.format("%06d", i), bigValue);
+            }
+            store.delete("victim");
+            assertTrue(store.get("victim").isEmpty());
+        }
+    }
+
+    @Test
+    void scanMergesMemtableAndSStables(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("a", "from-memtable");
+            String bigValue = "x".repeat(100);
+            for (int i = 0; i < 20_000; i++) {
+                store.put("filler-" + String.format("%06d", i), bigValue);
+            }
+            store.put("b", "also-memtable");
+            Map<String, String> result = store.scan("a", "c");
+            assertEquals("from-memtable", result.get("a"));
+            assertEquals("also-memtable", result.get("b"));
+        }
+    }
+
+    @Test
+    void newerValueOverridesOlderInScan(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("key", "old-value");
+            String bigValue = "x".repeat(100);
+            for (int i = 0; i < 20_000; i++) {
+                store.put("filler-" + String.format("%06d", i), bigValue);
+            }
+            store.put("key", "new-value");
+            assertEquals(Optional.of("new-value"), store.get("key"));
+            Map<String, String> scan = store.scan("key", "key\0");
+            assertEquals("new-value", scan.get("key"));
+        }
+    }
 }
