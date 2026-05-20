@@ -40,11 +40,14 @@ public final class WriteAheadLog implements AutoCloseable {
     private final DataOutputStream out;
 
     public WriteAheadLog(Path path) throws IOException {
+        this(path, false);
+    }
+
+    public WriteAheadLog(Path path, boolean truncate) throws IOException {
         this.path = path;
         Files.createDirectories(path.toAbsolutePath().getParent());
-        // append = true so re-opening an existing store keeps prior records.
         this.out = new DataOutputStream(
-                new BufferedOutputStream(new FileOutputStream(path.toFile(), true)));
+                new BufferedOutputStream(new FileOutputStream(path.toFile(), !truncate)));
     }
 
     public synchronized void appendPut(String key, String value) throws IOException {

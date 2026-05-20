@@ -71,4 +71,18 @@ class WriteAheadLogTest {
         assertEquals("1", state.get("first"));
         assertEquals("2", state.get("second"));
     }
+
+    @Test
+    void resetTruncatesExistingLog(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+        try (WriteAheadLog wal = new WriteAheadLog(log, false)) {
+            wal.appendPut("old", "data");
+        }
+        try (WriteAheadLog wal = new WriteAheadLog(log, true)) {
+            wal.appendPut("new", "data");
+        }
+        Map<String, String> state = replayInto(log);
+        assertNull(state.get("old"));
+        assertEquals("data", state.get("new"));
+    }
 }
