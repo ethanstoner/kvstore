@@ -150,6 +150,36 @@ mvn verify                    # compile + run the full test suite
 mvn package                   # build target/kvstore-0.1.0.jar
 ```
 
+### With Docker
+
+```bash
+# Build the image
+docker build -t kvstore .
+
+# Run the server (data persisted to a Docker volume)
+docker run -d --name kvstore -p 6379:6379 -v kvdata:/data kvstore
+
+# Connect from anywhere with a Redis client
+redis-cli -p 6379 ping
+redis-cli -p 6379 set hello world
+redis-cli -p 6379 get hello
+
+# With auth + TLS:
+docker run -d --name kvstore -p 6379:6379 -v kvdata:/data \
+    -v /path/to/kv.jks:/certs/kv.jks:ro \
+    kvstore serve --port 6379 --data /data \
+    --user alice:secret1 --user bob:secret2 \
+    --tls-keystore /certs/kv.jks --tls-keystore-pass changeit
+
+# Tail logs
+docker logs -f kvstore
+
+# Stop
+docker stop kvstore
+```
+
+The image runs as a non-root user, exposes port 6379, and stores all data under `/data` (declared as a volume).
+
 ### As a network server (Redis-compatible)
 
 ```bash

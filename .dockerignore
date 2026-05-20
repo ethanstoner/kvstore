@@ -1,0 +1,11 @@
+target/
+.git/
+.idea/
+.vscode/
+*.iml
+.claude/
+docs/
+README.md
+*.log
+kvdata/
+.gitignore
