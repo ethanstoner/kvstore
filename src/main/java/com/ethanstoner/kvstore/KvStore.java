@@ -8,10 +8,10 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.NavigableSet;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
@@ -57,6 +57,16 @@ public final class KvStore implements AutoCloseable {
 
     /** Flush the memtable to disk once it exceeds this many bytes. */
     static final long FLUSH_THRESHOLD_BYTES = 4L * 1024 * 1024; // 4 MB
+
+    // ---- Leveled compaction knobs -------------------------------------------
+    /** Trigger L0 → L1 compaction once L0 holds this many files. */
+    static final int L0_TRIGGER_FILES = 4;
+    /** Target total size for L1 in bytes. */
+    static final long L1_TARGET_BYTES = 10L * 1024 * 1024;   // 10 MB
+    /** Each successive level is this many times larger than the previous. */
+    static final int LEVEL_SIZE_MULTIPLIER = 10;
+    /** Maximum size of a single output SSTable produced by compaction. */
+    static final long TARGET_SSTABLE_BYTES = 2L * 1024 * 1024; // 2 MB
 
     private static final String WAL_NAME         = "wal.log";
     private static final String WAL_PENDING_NAME = "wal-pending.log";
@@ -136,16 +146,19 @@ public final class KvStore implements AutoCloseable {
         Files.createDirectories(dataDir);
 
         // --- 1. Open existing SSTables ------------------------------------------
+        // Accept both legacy "sst-*.db" names (treated as L0) and new "L*-*.db" names.
         List<SSTable> loaded = new ArrayList<>();
-        try (DirectoryStream<Path> ds =
-                     Files.newDirectoryStream(dataDir, "sst-*.db")) {
-            for (Path p : ds) {
-                try {
-                    SSTable sst = SSTable.open(p);
-                    sst.attachCache(blockCache);
-                    loaded.add(sst);
-                } catch (IOException e) {
-                    // Skip corrupt / incomplete files.
+        for (String glob : new String[]{"sst-*.db", "L*-*.db"}) {
+            try (DirectoryStream<Path> ds =
+                         Files.newDirectoryStream(dataDir, glob)) {
+                for (Path p : ds) {
+                    try {
+                        SSTable sst = SSTable.open(p);
+                        sst.attachCache(blockCache);
+                        loaded.add(sst);
+                    } catch (IOException e) {
+                        // Skip corrupt / incomplete files.
+                    }
                 }
             }
         }
@@ -153,9 +166,8 @@ public final class KvStore implements AutoCloseable {
         loaded.sort(Comparator.comparingInt(SSTable::sequenceNum));
         this.sstables = Collections.unmodifiableList(loaded);
 
-        // Determine next sequence number.
-        int maxSeq = loaded.isEmpty() ? -1
-                : loaded.get(loaded.size() - 1).sequenceNum();
+        // Determine next sequence number (consider all loaded files).
+        int maxSeq = loaded.stream().mapToInt(SSTable::sequenceNum).max().orElse(-1);
         this.nextSequence = maxSeq + 1;
 
         // --- 2. Build fresh memtable from WAL replay ----------------------------
@@ -400,7 +412,8 @@ public final class KvStore implements AutoCloseable {
      */
     private void doBackgroundFlush(Memtable immutable, int seq) {
         try {
-            Path sstPath = SSTable.fileName(dataDir, seq);
+            // Flush outputs always go to L0.
+            Path sstPath = SSTable.fileName(dataDir, 0, seq);
             SSTable.write(sstPath, immutable.entries());
             SSTable newSst = SSTable.open(sstPath);
             newSst.attachCache(blockCache);
@@ -462,78 +475,197 @@ public final class KvStore implements AutoCloseable {
         runCompaction();
     }
 
+    /**
+     * Returns the maximum total bytes allowed for a given level.
+     * L0 is gated by file count, not size, so we return {@link Long#MAX_VALUE}.
+     */
+    private static long sizeLimitForLevel(int level) {
+        if (level == 0) return Long.MAX_VALUE;
+        long limit = L1_TARGET_BYTES;
+        for (int i = 1; i < level; i++) limit *= LEVEL_SIZE_MULTIPLIER;
+        return limit;
+    }
+
+    /**
+     * LevelDB-style leveled compaction.
+     *
+     * <ul>
+     *   <li>L0: capped at {@link #L0_TRIGGER_FILES} files (they may overlap).</li>
+     *   <li>L1+: capped at {@link #sizeLimitForLevel} bytes; each level is
+     *       {@link #LEVEL_SIZE_MULTIPLIER}× larger than the previous.</li>
+     *   <li>Within a level (L1+), SSTables have non-overlapping key ranges.</li>
+     * </ul>
+     */
     private void runCompaction() throws IOException {
         List<SSTable> snapshot = sstables;
-        if (snapshot.size() < 4) return;
+        if (snapshot.isEmpty()) return;
 
-        // Group by size tier (order of magnitude)
-        Map<Integer, List<SSTable>> tiers = new HashMap<>();
+        // ── Group by level ────────────────────────────────────────────────────
+        TreeMap<Integer, List<SSTable>> byLevel = new TreeMap<>();
+        int maxLevel = 0;
         for (SSTable sst : snapshot) {
-            int tier = (int) Math.floor(Math.log10(Math.max(1, sst.fileSize())));
-            tiers.computeIfAbsent(tier, k -> new ArrayList<>()).add(sst);
+            int lvl = sst.level();
+            byLevel.computeIfAbsent(lvl, k -> new ArrayList<>()).add(sst);
+            if (lvl > maxLevel) maxLevel = lvl;
         }
 
-        // Find a tier with 4+ SSTables, or compact all
-        List<SSTable> toCompact = null;
-        for (List<SSTable> group : tiers.values()) {
-            if (group.size() >= 4) {
-                toCompact = group;
+        // ── Pick a level to compact ───────────────────────────────────────────
+        // Priority: L0 if it has ≥ L0_TRIGGER_FILES, else deepest over-size level.
+        int compactLevel = -1;
+        if (byLevel.getOrDefault(0, List.of()).size() >= L0_TRIGGER_FILES) {
+            compactLevel = 0;
+        } else {
+            for (int lvl = maxLevel; lvl >= 1; lvl--) {
+                long total = byLevel.getOrDefault(lvl, List.of()).stream()
+                        .mapToLong(s -> {
+                            try { return s.fileSize(); } catch (IOException e) { return 0L; }
+                        })
+                        .sum();
+                if (total > sizeLimitForLevel(lvl)) {
+                    compactLevel = lvl;
+                    break;
+                }
+            }
+        }
+        if (compactLevel < 0) return; // nothing to do
+
+        int outputLevel = compactLevel + 1;
+
+        // ── Choose inputs ─────────────────────────────────────────────────────
+        List<SSTable> inputs = new ArrayList<>();
+        List<SSTable> currentLevel = new ArrayList<>(
+                byLevel.getOrDefault(compactLevel, List.of()));
+        currentLevel.sort(Comparator.comparingInt(SSTable::sequenceNum));
+
+        String inputMinKey, inputMaxKey;
+        if (compactLevel == 0) {
+            // All of L0 (files may overlap each other; compact them all together).
+            inputs.addAll(currentLevel);
+            if (inputs.isEmpty()) return;
+            inputMinKey = inputs.stream()
+                    .filter(s -> !s.keySet().isEmpty())
+                    .map(s -> s.keySet().first())
+                    .min(Comparator.naturalOrder()).orElse(null);
+            inputMaxKey = inputs.stream()
+                    .filter(s -> !s.keySet().isEmpty())
+                    .map(s -> s.keySet().last())
+                    .max(Comparator.naturalOrder()).orElse(null);
+        } else {
+            // Pick the oldest SSTable from this level.
+            SSTable picked = currentLevel.get(0);
+            NavigableSet<String> keys = picked.keySet();
+            if (keys.isEmpty()) return;
+            inputs.add(picked);
+            inputMinKey = keys.first();
+            inputMaxKey = keys.last();
+        }
+        if (inputMinKey == null) return;
+
+        // Add all overlapping SSTables from outputLevel.
+        for (SSTable s : byLevel.getOrDefault(outputLevel, List.of())) {
+            NavigableSet<String> keys = s.keySet();
+            if (keys.isEmpty()) continue;
+            String smin = keys.first();
+            String smax = keys.last();
+            // Overlap if NOT (smax < inputMin OR smin > inputMax)
+            if (!(smax.compareTo(inputMinKey) < 0 || smin.compareTo(inputMaxKey) > 0)) {
+                inputs.add(s);
+            }
+        }
+
+        // ── Tombstone-drop safety ─────────────────────────────────────────────
+        // Only drop tombstones if nothing exists below outputLevel that could
+        // still hold a shadowed value for the key range being compacted.
+        boolean canDropTombstones = true;
+        for (int lvl = outputLevel + 1; lvl <= maxLevel; lvl++) {
+            if (!byLevel.getOrDefault(lvl, List.of()).isEmpty()) {
+                canDropTombstones = false;
                 break;
             }
         }
-        if (toCompact == null) {
-            toCompact = new ArrayList<>(snapshot);
-        }
 
-        // Is this a full compaction?
-        boolean fullCompaction = toCompact.size() == snapshot.size();
-
-        // K-way merge: newest-first so putIfAbsent keeps newest value
+        // ── K-way merge (newest sequence wins per key) ────────────────────────
         TreeMap<String, String> merged = new TreeMap<>();
-        List<SSTable> sorted = new ArrayList<>(toCompact);
-        sorted.sort(Comparator.comparingInt(SSTable::sequenceNum).reversed());
-
-        for (SSTable sst : sorted) {
-            if (sst.keySet().isEmpty()) continue;
-            NavigableMap<String, String> all = sst.scan(
-                    sst.keySet().first(), sst.keySet().last() + "\0");
+        List<SSTable> sortedByAge = new ArrayList<>(inputs);
+        sortedByAge.sort(Comparator.comparingInt(SSTable::sequenceNum).reversed());
+        for (SSTable s : sortedByAge) {
+            NavigableSet<String> keys = s.keySet();
+            if (keys.isEmpty()) continue;
+            NavigableMap<String, String> all = s.scan(keys.first(), keys.last() + "\0");
             for (Map.Entry<String, String> e : all.entrySet()) {
                 merged.putIfAbsent(e.getKey(), e.getValue());
             }
         }
 
-        // Drop tombstones only in full compaction
-        if (fullCompaction) {
+        if (canDropTombstones) {
             merged.values().removeIf(v -> Memtable.TOMBSTONE.equals(v));
         }
 
+        // ── Split output into bounded-size SSTables ───────────────────────────
+        List<List<Map.Entry<String, String>>> chunks = new ArrayList<>();
+        List<Map.Entry<String, String>> chunk = new ArrayList<>();
+        long chunkBytes = 0L;
+        for (Map.Entry<String, String> e : merged.entrySet()) {
+            chunk.add(e);
+            chunkBytes += e.getKey().length() + e.getValue().length() + 10;
+            if (chunkBytes >= TARGET_SSTABLE_BYTES) {
+                chunks.add(chunk);
+                chunk = new ArrayList<>();
+                chunkBytes = 0L;
+            }
+        }
+        if (!chunk.isEmpty()) chunks.add(chunk);
+
+        // ── Allocate sequence numbers (under lock, but do disk I/O outside) ───
+        int firstSeq;
         flushLock.lock();
         try {
-            if (merged.isEmpty()) {
-                List<SSTable> newList = new ArrayList<>(sstables);
-                for (SSTable old : toCompact) {
-                    newList.remove(old);
-                    old.close();
-                    Files.deleteIfExists(old.path());
+            firstSeq = nextSequence;
+            nextSequence += Math.max(1, chunks.size()); // reserve at least 1
+        } finally {
+            flushLock.unlock();
+        }
+
+        // ── Write output SSTables (no lock during disk I/O) ───────────────────
+        List<SSTable> newSstables = new ArrayList<>();
+        List<Path>    newPaths    = new ArrayList<>();
+        try {
+            if (chunks.isEmpty()) {
+                // All entries were tombstones and got dropped — nothing to write.
+                // Fall through to the atomic-swap section which will just delete inputs.
+            } else {
+                for (int i = 0; i < chunks.size(); i++) {
+                    Path outPath = SSTable.fileName(dataDir, outputLevel, firstSeq + i);
+                    SSTable.write(outPath, chunks.get(i));
+                    SSTable opened = SSTable.open(outPath);
+                    opened.attachCache(blockCache);
+                    newSstables.add(opened);
+                    newPaths.add(outPath);
                 }
-                sstables = Collections.unmodifiableList(newList);
-                return;
             }
-
-            Path mergedPath = SSTable.fileName(dataDir, nextSequence++);
-            SSTable.write(mergedPath, merged.entrySet());
-            SSTable mergedSst = SSTable.open(mergedPath);
-            mergedSst.attachCache(blockCache);
-
-            List<SSTable> newList = new ArrayList<>(sstables);
-            for (SSTable old : toCompact) {
-                newList.remove(old);
-                old.close();
-                Files.deleteIfExists(old.path());
+        } catch (IOException e) {
+            // Roll back any partial writes before re-throwing.
+            for (SSTable s : newSstables) {
+                try { s.close(); } catch (IOException ignored) {}
             }
-            newList.add(mergedSst);
-            newList.sort(Comparator.comparingInt(SSTable::sequenceNum));
-            sstables = Collections.unmodifiableList(newList);
+            for (Path p : newPaths) {
+                try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+            }
+            throw e;
+        }
+
+        // ── Atomic swap under lock ─────────────────────────────────────────────
+        flushLock.lock();
+        try {
+            List<SSTable> updated = new ArrayList<>(sstables);
+            for (SSTable old : inputs) {
+                updated.remove(old);
+                try { old.close(); } catch (IOException ignored) {}
+                try { Files.deleteIfExists(old.path()); } catch (IOException ignored) {}
+            }
+            updated.addAll(newSstables);
+            updated.sort(Comparator.comparingInt(SSTable::sequenceNum));
+            sstables = Collections.unmodifiableList(updated);
         } finally {
             flushLock.unlock();
         }

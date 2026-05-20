@@ -161,18 +161,24 @@ class KvStoreTest {
             for (int i = 0; i < 80_000; i++) {
                 store.put("key-" + String.format("%06d", i), bigValue);
             }
-            long beforeCount = java.nio.file.Files.list(dir)
+            long l0Before = java.nio.file.Files.list(dir)
                     .filter(p -> p.getFileName().toString().endsWith(".db"))
+                    .filter(p -> SSTable.levelOf(p) == 0)
                     .count();
-            assertTrue(beforeCount >= 4, "Expected >=4 SSTables, got " + beforeCount);
+            assertTrue(l0Before >= 4, "Expected >=4 L0 SSTables before compaction, got " + l0Before);
 
+            // With leveled compaction a single call promotes all of L0 into L1.
+            // Run up to 3 passes so any remaining L0 files are also compacted.
+            store.compactNow();
+            store.compactNow();
             store.compactNow();
 
-            long afterCount = java.nio.file.Files.list(dir)
+            long l0After = java.nio.file.Files.list(dir)
                     .filter(p -> p.getFileName().toString().endsWith(".db"))
+                    .filter(p -> SSTable.levelOf(p) == 0)
                     .count();
-            assertTrue(afterCount < beforeCount,
-                    "Expected fewer SSTables after compaction: before=" + beforeCount + " after=" + afterCount);
+            assertTrue(l0After < l0Before,
+                    "Expected fewer L0 SSTables after compaction: before=" + l0Before + " after=" + l0After);
 
             assertEquals(Optional.of(bigValue), store.get("key-000000"));
             assertEquals(Optional.of(bigValue), store.get("key-079999"));
@@ -192,7 +198,11 @@ class KvStoreTest {
                 store.put("pad2-" + String.format("%06d", i), bigValue);
             }
 
-            store.compactNow();
+            // With leveled compaction a tombstone may need several passes to
+            // reach the deepest level (where it is safe to drop).
+            for (int i = 0; i < 5; i++) {
+                store.compactNow();
+            }
 
             assertTrue(store.get("doomed").isEmpty());
         }

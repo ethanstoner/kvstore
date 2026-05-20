@@ -50,7 +50,7 @@ public final class SSTable implements AutoCloseable {
     private static final int COMPRESS_THRESHOLD_BYTES = 64;
 
     private static final Pattern FILENAME_PATTERN =
-            Pattern.compile("sst-(\\d+)\\.db");
+            Pattern.compile("(?:sst-|L(\\d+)-)(\\d+)\\.db");
 
     // -------------------------------------------------------------------------
     // Fields
@@ -61,6 +61,7 @@ public final class SSTable implements AutoCloseable {
     private final BloomFilter             bloom;
     private final TreeMap<String, Long>   index;   // key -> absolute data offset
     private final int                     entryCount;
+    private final int                     level;
 
     /** Optional shared LRU cache; {@code null} means no caching. */
     private BlockCache cache;
@@ -79,6 +80,7 @@ public final class SSTable implements AutoCloseable {
         this.bloom      = bloom;
         this.index      = index;
         this.entryCount = entryCount;
+        this.level      = levelOf(filePath);
     }
 
     // =========================================================================
@@ -367,12 +369,18 @@ public final class SSTable implements AutoCloseable {
         return entryCount;
     }
 
+    /** @return the level this SSTable belongs to (0 for L0, 1 for L1, etc.). */
+    public int level() {
+        return level;
+    }
+
     // =========================================================================
     // Static helpers
     // =========================================================================
 
     /**
-     * Extracts the sequence number from a filename like {@code "sst-000042.db"}.
+     * Extracts the sequence number from a filename like {@code "sst-000042.db"}
+     * or {@code "L1-000005.db"}.
      *
      * @param file path whose {@linkplain Path#getFileName() filename} to parse
      * @return the sequence number, or -1 if the name does not match
@@ -381,12 +389,30 @@ public final class SSTable implements AutoCloseable {
         String name = file.getFileName().toString();
         Matcher m = FILENAME_PATTERN.matcher(name);
         if (!m.matches()) return -1;
-        return Integer.parseInt(m.group(1));
+        // group(1) = level digits (null for legacy sst- prefix), group(2) = seq digits
+        return Integer.parseInt(m.group(2));
+    }
+
+    /**
+     * Extracts the level from a filename like {@code "L1-000005.db"} or
+     * {@code "sst-000042.db"} (legacy = level 0).
+     *
+     * @param file path whose {@linkplain Path#getFileName() filename} to parse
+     * @return the level, or -1 if the name does not match
+     */
+    public static int levelOf(Path file) {
+        String name = file.getFileName().toString();
+        Matcher m = FILENAME_PATTERN.matcher(name);
+        if (!m.matches()) return -1;
+        return m.group(1) == null ? 0 : Integer.parseInt(m.group(1));
     }
 
     /**
      * Generates the canonical filename for an SSTable with the given sequence
      * number, e.g. {@code sequenceNumber = 42} → {@code "sst-000042.db"}.
+     *
+     * <p>Kept for backward compatibility; new compaction code uses
+     * {@link #fileName(Path, int, int)}.
      *
      * @param dir    directory in which the file will live
      * @param seqNum sequence number (must be &gt;= 0)
@@ -394,6 +420,19 @@ public final class SSTable implements AutoCloseable {
      */
     public static Path fileName(Path dir, int seqNum) {
         return dir.resolve(String.format("sst-%06d.db", seqNum));
+    }
+
+    /**
+     * Generates the leveled filename for an SSTable, e.g. level=1, seq=5 →
+     * {@code "L1-000005.db"}.
+     *
+     * @param dir   directory in which the file will live
+     * @param level the LSM level (0, 1, 2, …)
+     * @param seq   sequence number (must be &gt;= 0)
+     * @return full path {@code dir/L<level>-NNNNNN.db}
+     */
+    public static Path fileName(Path dir, int level, int seq) {
+        return dir.resolve(String.format("L%d-%06d.db", level, seq));
     }
 
     // =========================================================================
