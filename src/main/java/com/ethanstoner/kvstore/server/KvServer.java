@@ -87,6 +87,9 @@ public final class KvServer implements AutoCloseable {
 
     public PubSubHub pubSubHub() { return pubSubHub; }
 
+    /** Exposes the UserStore for permission checks. */
+    public UserStore userStore() { return users; }
+
     public boolean isAuthRequired() { return users.isAuthRequired(); }
 
     /**

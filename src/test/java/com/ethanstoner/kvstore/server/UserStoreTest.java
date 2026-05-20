@@ -50,4 +50,39 @@ class UserStoreTest {
         assertFalse(s.hasUser("bob"));
         assertFalse(s.hasUser("default"));
     }
+
+    @Test
+    void userWithEmptyAllowlistCanRunAnyCommand() {
+        UserStore s = UserStore.builder().addUser("admin", "x").build();
+        assertTrue(s.canRun("admin", "SET"));
+        assertTrue(s.canRun("admin", "DEL"));
+        assertTrue(s.canRun("admin", "FLUSHALL"));
+    }
+
+    @Test
+    void userWithAllowlistOnlyRunsAllowedCommands() {
+        UserStore s = UserStore.builder()
+                .addUser("readonly", "x", java.util.Set.of("GET", "MGET", "EXISTS"))
+                .build();
+        assertTrue(s.canRun("readonly", "GET"));
+        assertTrue(s.canRun("readonly", "MGET"));
+        assertFalse(s.canRun("readonly", "SET"));
+        assertFalse(s.canRun("readonly", "DEL"));
+    }
+
+    @Test
+    void allowlistCheckIsCaseInsensitive() {
+        UserStore s = UserStore.builder()
+                .addUser("u", "p", java.util.Set.of("get", "set"))
+                .build();
+        assertTrue(s.canRun("u", "GET"));
+        assertTrue(s.canRun("u", "get"));
+        assertTrue(s.canRun("u", "Set"));
+    }
+
+    @Test
+    void missingUserCannotRunAnyCommand() {
+        UserStore s = UserStore.builder().addUser("u", "p", java.util.Set.of("GET")).build();
+        assertFalse(s.canRun("ghost", "GET"));
+    }
 }

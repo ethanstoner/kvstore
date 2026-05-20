@@ -4,4 +4,10 @@ package com.ethanstoner.kvstore.server;
 public interface AuthState {
     boolean isAuthenticated();
     void markAuthenticated();
+
+    /** Mark this connection authenticated for the given username. */
+    default void markAuthenticated(String username) { markAuthenticated(); }
+
+    /** Returns the authenticated username, or {@code null} if not yet authenticated. */
+    default String authenticatedUsername() { return null; }
 }

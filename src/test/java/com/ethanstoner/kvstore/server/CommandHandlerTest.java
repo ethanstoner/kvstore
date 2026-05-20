@@ -18,8 +18,11 @@ class CommandHandlerTest {
     /** Mutable auth stub used by tests; starts authenticated so existing tests are unaffected. */
     static class AuthStub implements AuthState {
         boolean authed = true;
+        String username;  // NEW: tracks which user is authenticated
         @Override public boolean isAuthenticated() { return authed; }
         @Override public void markAuthenticated() { authed = true; }
+        @Override public void markAuthenticated(String u) { authed = true; this.username = u; }
+        @Override public String authenticatedUsername() { return username; }
     }
 
     KvStore store;
@@ -496,5 +499,80 @@ class CommandHandlerTest {
         assertTrue(reply.endsWith("\r\n"), reply);
         long ts = Long.parseLong(reply.substring(1, reply.indexOf("\r")));
         assertTrue(ts > 0, "expected positive epoch, got " + ts);
+    }
+
+    // ── Per-user permission tests ─────────────────────────────────────────────
+
+    @Test
+    void permissionDeniedForDisallowedCommand(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            UserStore users = UserStore.builder()
+                    .addUser("reader", "pw", java.util.Set.of("GET", "EXISTS"))
+                    .build();
+            KvServer permServer = new KvServer(s, 0, users, null);
+            CommandHandler permHandler = new CommandHandler(s, permServer);
+            AuthStub authed = new AuthStub();
+            authed.authed = true;
+            authed.username = "reader";
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            permHandler.handle(new String[]{"SET", "k", "v"}, out, authed);
+            String reply = out.toString("UTF-8");
+            assertTrue(reply.startsWith("-NOPERM"), reply);
+            assertTrue(reply.contains("'SET'"), reply);
+        }
+    }
+
+    @Test
+    void permissionAllowedForAllowlistedCommand(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            UserStore users = UserStore.builder()
+                    .addUser("reader", "pw", java.util.Set.of("GET", "EXISTS"))
+                    .build();
+            KvServer permServer = new KvServer(s, 0, users, null);
+            CommandHandler permHandler = new CommandHandler(s, permServer);
+            AuthStub authed = new AuthStub();
+            authed.authed = true;
+            authed.username = "reader";
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            permHandler.handle(new String[]{"GET", "k"}, out, authed);
+            // GET on missing key: $-1\r\n
+            assertEquals("$-1\r\n", out.toString("UTF-8"));
+        }
+    }
+
+    @Test
+    void userWithEmptyAllowlistCanRunAnything(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            UserStore users = UserStore.builder().addUser("admin", "pw").build();
+            KvServer permServer = new KvServer(s, 0, users, null);
+            CommandHandler permHandler = new CommandHandler(s, permServer);
+            AuthStub authed = new AuthStub();
+            authed.authed = true;
+            authed.username = "admin";
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            permHandler.handle(new String[]{"SET", "k", "v"}, out, authed);
+            assertEquals("+OK\r\n", out.toString("UTF-8"));
+        }
+    }
+
+    @Test
+    void pingAllowedEvenWithRestrictedUser(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            UserStore users = UserStore.builder()
+                    .addUser("locked", "pw", java.util.Set.of("GET"))  // no PING
+                    .build();
+            KvServer permServer = new KvServer(s, 0, users, null);
+            CommandHandler permHandler = new CommandHandler(s, permServer);
+            AuthStub authed = new AuthStub();
+            authed.authed = true;
+            authed.username = "locked";
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            permHandler.handle(new String[]{"PING"}, out, authed);
+            assertEquals("+PONG\r\n", out.toString("UTF-8"));
+        }
     }
 }

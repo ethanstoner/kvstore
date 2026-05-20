@@ -365,4 +365,34 @@ class KvServerTest {
             assertTrue(info.contains("max_connections:unlimited"), info);
         }
     }
+
+    // ── Per-user permission integration test ────────────────────────────────
+
+    @Test
+    void readOnlyUserCannotWriteOverTcp(@TempDir Path dir) throws IOException {
+        UserStore users = UserStore.builder()
+                .addUser("reader", "pw", java.util.Set.of("GET", "EXISTS", "PING"))
+                .build();
+        try (KvStore store = new KvStore(dir);
+             KvServer server = new KvServer(store, 0, users, null)) {
+            server.start();
+            int port = server.port();
+
+            try (java.net.Socket sock = new java.net.Socket("127.0.0.1", port)) {
+                sock.setSoTimeout(3000);
+                sendResp(sock, new String[]{"AUTH", "reader", "pw"});
+                assertEquals("+OK\r\n", readOneRespReply(sock.getInputStream()));
+
+                // GET is allowed
+                sendResp(sock, new String[]{"GET", "any"});
+                String getReply = readOneRespReply(sock.getInputStream());
+                assertEquals("$-1\r\n", getReply);
+
+                // SET is NOT allowed
+                sendResp(sock, new String[]{"SET", "k", "v"});
+                String setReply = readOneRespReply(sock.getInputStream());
+                assertTrue(setReply.startsWith("-NOPERM"), setReply);
+            }
+        }
+    }
 }

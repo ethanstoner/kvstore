@@ -40,12 +40,18 @@ public final class ServeCommand {
                 case "--user" -> {
                     if (++i >= args.length) { usage(); return; }
                     String spec = args[i];
-                    int colon = spec.indexOf(':');
-                    if (colon < 1 || colon == spec.length() - 1) {
-                        System.err.println("--user must be in form name:password");
+                    String[] parts = spec.split(":", 3);
+                    if (parts.length < 2 || parts[0].isEmpty() || parts[1].isEmpty()) {
+                        System.err.println("--user must be in form name:password[:cmd1,cmd2,...]");
                         return;
                     }
-                    userBuilder.addUser(spec.substring(0, colon), spec.substring(colon + 1));
+                    String username = parts[0];
+                    String password = parts[1];
+                    java.util.Set<String> commands = java.util.Set.of();
+                    if (parts.length == 3 && !parts[2].isEmpty() && !parts[2].equals("*")) {
+                        commands = new java.util.HashSet<>(java.util.Arrays.asList(parts[2].split(",")));
+                    }
+                    userBuilder.addUser(username, password, commands);
                     anyUsers = true;
                 }
                 case "--tls-keystore" -> {
@@ -111,13 +117,17 @@ public final class ServeCommand {
     private static void usage() {
         System.out.println("""
                 kvstore serve [--port PORT] [--data DIR] [--requirepass PASSWORD]
-                              [--user name:password] [--tls-keystore PATH] [--tls-keystore-pass PASS]
-                              [--max-connections N]
+                              [--user name:password[:cmd1,cmd2,...]] [--tls-keystore PATH]
+                              [--tls-keystore-pass PASS] [--max-connections N]
                   --port               port to listen on (default 6379)
                   --data               data directory (default ./kvdata)
                   --requirepass        single-password mode: require AUTH <password> (the "default" user)
                   --user name:pass     multi-user mode: add a named user (repeatable)
                                        e.g. --user alice:secret1 --user bob:secret2
+                                       Optional third field: comma-separated command allowlist.
+                                       Omit or use * to allow all commands (default).
+                                       e.g. --user reader:pw:GET,MGET,EXISTS,TTL
+                                            --user writer:pw:GET,SET,DEL,INCR,DECR
                                        --requirepass and --user can be combined; --requirepass sets "default"
                   --tls-keystore       path to a JKS keystore for TLS (enables TLS mode)
                   --tls-keystore-pass  password for the JKS keystore (default: empty)

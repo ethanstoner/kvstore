@@ -63,6 +63,23 @@ public final class CommandHandler {
             }
         }
 
+        // Permission check — only when auth is required and command is not in the pre-auth allowlist.
+        if (server.isAuthRequired()
+                && !cmd.equals("AUTH") && !cmd.equals("PING")
+                && !cmd.equals("QUIT") && !cmd.equals("COMMAND")) {
+            String user = auth.authenticatedUsername();
+            if (user == null) {
+                // Defensive: auth gate above should have blocked unauthenticated requests.
+                RespWriter.writeError(out, "NOAUTH Authentication required.");
+                return;
+            }
+            if (!server.userStore().canRun(user, cmd)) {
+                RespWriter.writeError(out,
+                        "NOPERM this user has no permissions to run the '" + cmd + "' command");
+                return;
+            }
+        }
+
         try {
             switch (cmd) {
                 case "AUTH"     -> auth(args, out, auth);
@@ -132,7 +149,7 @@ public final class CommandHandler {
         }
 
         if (server.checkAuth(username, password)) {
-            conn.markAuthenticated();
+            conn.markAuthenticated(username);
             RespWriter.writeSimpleString(out, "OK");
         } else {
             RespWriter.writeError(out,

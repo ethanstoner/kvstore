@@ -23,6 +23,7 @@ final class ClientConnection implements Runnable, AuthState {
     private final KvServer server;
     private final CommandHandler handler;
     private boolean authenticated;
+    private volatile String authenticatedUsername;
 
     // Pub/Sub state
     private final Set<String> subscribedChannels = ConcurrentHashMap.newKeySet();
@@ -44,6 +45,15 @@ final class ClientConnection implements Runnable, AuthState {
 
     @Override
     public void markAuthenticated() { this.authenticated = true; }
+
+    @Override
+    public void markAuthenticated(String username) {
+        this.authenticated = true;
+        this.authenticatedUsername = username;
+    }
+
+    @Override
+    public String authenticatedUsername() { return authenticatedUsername; }
 
     // ── Pub/Sub accessors ────────────────────────────────────────────────────
 
