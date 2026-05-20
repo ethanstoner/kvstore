@@ -38,6 +38,7 @@ public final class KvServer implements AutoCloseable {
     private final KvStore store;
     private final int requestedPort;
     private final String requirePassword;
+    private final TlsConfig tls;
 
     private final Set<ClientConnection> activeConnections =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
@@ -52,13 +53,18 @@ public final class KvServer implements AutoCloseable {
     private volatile boolean running;
 
     public KvServer(KvStore store, int port) {
-        this(store, port, null);
+        this(store, port, null, null);
     }
 
     public KvServer(KvStore store, int port, String requirePassword) {
+        this(store, port, requirePassword, null);
+    }
+
+    public KvServer(KvStore store, int port, String requirePassword, TlsConfig tls) {
         this.store = store;
         this.requestedPort = port;
         this.requirePassword = requirePassword;
+        this.tls = tls;
     }
 
     public boolean isAuthRequired() { return requirePassword != null; }
@@ -76,7 +82,9 @@ public final class KvServer implements AutoCloseable {
 
     public synchronized void start() throws IOException {
         if (running) throw new IllegalStateException("already running");
-        this.serverSocket = new ServerSocket(requestedPort);
+        this.serverSocket = (tls == null)
+                ? new ServerSocket(requestedPort)
+                : tls.factory().createServerSocket(requestedPort);
         this.running = true;
         CommandHandler handler = new CommandHandler(store, this);
         this.acceptThread = new Thread(() -> acceptLoop(handler), "kvstore-accept");
