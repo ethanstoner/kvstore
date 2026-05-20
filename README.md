@@ -9,7 +9,7 @@ $ java -jar kvstore.jar put user:42 Ethan
 OK
 $ java -jar kvstore.jar get user:42
 Ethan
-# kill the process, run again — the value is still there (rebuilt from the WAL)
+# kill the process, run again — the value is still there
 ```
 
 ## Why this project exists
@@ -22,35 +22,53 @@ The public API is three functions (`put`, `get`, `delete`). All the engineering 
         put(k, v) / delete(k)
                 │
                 ▼
-   ┌────────────────────────┐   1. append (durable)
-   │   Write-Ahead Log      │ ◄─────────────────────┐
-   │   (append-only file)   │                       │
-   └────────────────────────┘                       │
-                │ replay on startup                  │
-                ▼                                    │
+   ┌────────────────────────┐   1. append (durable, fsync'd)
+   │   Write-Ahead Log      │
+   │   (append-only file)   │
+   └────────────────────────┘
+                │ replay on startup
+                ▼
    ┌────────────────────────┐   2. apply (fast, in RAM)
    │   Memtable             │   ConcurrentSkipListMap
    │   (sorted, in-memory)  │   — O(log n), keeps keys ordered
    └────────────────────────┘
-                │  (roadmap) flush when full
+                │ flush when > 4 MB
+                ▼
+   ┌────────────────────────┐   3. immutable sorted runs
+   │   SSTables on disk     │   binary format + bloom filter
+   │   + in-memory index    │   per file for fast lookups
+   └────────────────────────┘
+                │ merge when 4+ same-size
                 ▼
    ┌────────────────────────┐
-   │   SSTables on disk      │   immutable, sorted runs
-   │   + background compaction│   merged + tombstones dropped
+   │   Compacted SSTables   │   k-way merged, tombstones dropped
+   │   (background thread)  │   size-tiered compaction strategy
    └────────────────────────┘
 ```
 
-Every write is logged to disk **before** it is applied in memory — that ordering is what makes a crash survivable. On startup the log is replayed to rebuild the exact prior state.
+Every write is logged to disk **before** it is applied in memory — that ordering is what makes a crash survivable. When the memtable exceeds 4 MB, it is flushed to an immutable SSTable on disk. A background thread merges SSTables of similar size to bound read amplification and reclaim space from deleted keys.
 
 ## Complexity
 
 | Operation | Cost | Why |
 |-----------|------|-----|
-| `put` / `delete` | O(log n) memtable insert + O(1) amortized WAL append | sorted skip-list insert; sequential file write |
-| `get` (current) | O(log n) | single sorted memtable lookup |
-| `get` (after SSTables land) | O(log n) per level, newest-first | memtable → SSTables, short-circuits on first hit |
-| `scan(from, to)` | O(log n + k) | sub-map over a sorted structure, k = results |
-| Recovery on startup | O(m) | replay m logged records |
+| `put` / `delete` | O(log n) + O(1) amortized | sorted skip-list insert + sequential WAL append |
+| `get` | O(log n) per level | memtable → SSTables newest-first, bloom filter skips irrelevant files |
+| `scan(from, to)` | O(log n + k) per level | sub-map lookups merged across levels, k = results |
+| Flush | O(m) | sequential write of m memtable entries to sorted SSTable |
+| Compaction | O(m) | k-way merge of m total entries across selected SSTables |
+| Recovery | O(m) | replay m logged WAL records + open existing SSTables |
+
+## Features
+
+- **Durable writes** — write-ahead log with fsync; data survives crashes
+- **SSTable flush** — memtable spills to immutable sorted files when full
+- **Multi-level reads** — get/scan falls through memtable → newest SSTable → older ones
+- **Bloom filters** — probabilistic filter per SSTable skips files that can't contain a key (~1% false positive rate)
+- **Size-tiered compaction** — background thread merges SSTables of similar size, drops tombstones
+- **Crash recovery** — replays WAL on startup, skips corrupt SSTable files
+- **Range scans** — ordered `[from, to)` scans merged across all levels
+- **JMH benchmarks** — measure write/read/scan throughput
 
 ## Build & run
 
@@ -62,33 +80,51 @@ mvn package                   # build target/kvstore-0.1.0.jar
 java -jar target/kvstore-0.1.0.jar put hello world
 java -jar target/kvstore-0.1.0.jar get hello
 java -jar target/kvstore-0.1.0.jar scan a z
+java -jar target/kvstore-0.1.0.jar del hello
 ```
 
-CI (GitHub Actions) runs `mvn verify` on every push — see the badge above.
+## Benchmarks
 
-## Status
+```bash
+mvn package
+java -jar target/kvstore-0.1.0-benchmarks.jar           # run all benchmarks
+java -jar target/kvstore-0.1.0-benchmarks.jar ".*Read.*" # run only read benchmarks
+```
 
-**Working today:** durable `put`/`get`/`delete`/`scan`, write-ahead log, full crash-recovery (data survives a restart), JUnit 5 test suite, CI.
+Benchmarks measured with JMH (Java Microbenchmark Harness):
 
-**Roadmap — the LSM pieces, implemented as a learning path** (each is a self-contained next step; see the `// Roadmap` comments in `KvStore.java`):
-
-1. **SSTable flush** — when the memtable exceeds a size threshold, write it out as an immutable sorted file and start a fresh memtable + WAL.
-2. **Multi-level reads** — `get` falls through memtable → newest SSTable → older ones.
-3. **Compaction** — a background thread merges SSTables, dropping shadowed values and tombstones (k-way merge of sorted runs).
-4. **Bloom filters** — skip SSTables that provably can't contain a key.
-5. **JMH benchmarks** — measure write/read throughput before vs. after each step.
+| Benchmark | What it measures |
+|-----------|-----------------|
+| `sequentialWrite` | Sequential key inserts (best case for LSM) |
+| `randomWrite` | Random key inserts/updates |
+| `pointReadExistingKey` | Reads of keys known to exist |
+| `pointReadMissingKey` | Reads of keys that don't exist (bloom filter path) |
+| `scanRange` | Range scans of ~100 keys |
 
 ## Layout
 
 ```
 src/main/java/com/ethanstoner/kvstore/
-  Memtable.java        sorted in-memory buffer (skip list)
-  WriteAheadLog.java   append-only durability + replay
-  KvStore.java         ties it together; public API
-  cli/Main.java        put / get / del / scan command line
-src/test/java/...      JUnit 5 suite (memtable, WAL, recovery)
-.github/workflows/     CI
+  Memtable.java          sorted in-memory buffer (skip list)
+  WriteAheadLog.java     append-only durability + replay
+  SSTable.java           immutable sorted file (binary format + bloom filter + index)
+  BloomFilter.java       probabilistic set membership (MurmurHash3)
+  KvStore.java           ties it together; public API + flush + compaction
+  cli/Main.java          put / get / del / scan command line
+  benchmark/             JMH throughput benchmarks
+src/test/java/...        JUnit 5 suite (memtable, WAL, SSTable, bloom filter, recovery, compaction)
+.github/workflows/       CI
 ```
+
+## Roadmap
+
+Potential future work:
+
+- **Leveled compaction** — non-overlapping key ranges per level for better read amplification
+- **Block cache** — LRU cache for frequently-read SSTable blocks
+- **Concurrent flush** — immutable memtable during flush so writes don't stall
+- **WAL checksums** — detect partial/corrupt WAL entries on replay
+- **Compression** — Snappy or LZ4 per SSTable block
 
 ## License
 
