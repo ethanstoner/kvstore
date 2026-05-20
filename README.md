@@ -81,7 +81,9 @@ Every write is logged to disk **before** it is applied in memory — that orderi
 - **Multi-level reads** — get/scan falls through memtable → newest SSTable → older ones
 - **Bloom filters** — probabilistic filter per SSTable skips files that can't contain a key (~1% false positive rate)
 - **LRU block cache** — value cache shared across SSTables; hot reads skip the disk seek entirely
-- **Size-tiered compaction** — background thread merges SSTables of similar size, drops tombstones
+- **Per-value compression** — values > 64 bytes compressed with stdlib Deflate; auto-fallback on incompressible data
+- **Concurrent flush** — non-blocking memtable flush; writes don't stall on disk I/O. Crash-safe via dual-WAL
+- **Leveled compaction** — LevelDB/RocksDB-style: L0 (overlapping) + L1+ (non-overlapping, 10× growth). Bounded read amplification, lower space amp
 - **Atomic DEL** — check-and-delete under the write lock; concurrent clients see accurate counts
 - **Range scans** — ordered `[from, to)` scans merged across all levels
 - **Crash recovery** — replays WAL on startup (stops at first corrupt record), skips corrupt SSTable files
@@ -201,12 +203,11 @@ src/test/java/...        JUnit 5 suite: memtable, WAL, SSTable, bloom filter,
 
 Potential future work:
 
-- **Compression** — Snappy or LZ4 per SSTable
-- **Concurrent flush** — immutable memtable during flush so writes don't stall
-- **Leveled compaction** — non-overlapping key ranges per level for better read amplification at scale
 - **TLS** — encrypted transport for production deployments
 - **ACL with usernames** — Redis 6+ style multi-user authentication
+- **Block-level (not per-value) compression** — better ratio for small values
 - **Replace `synchronized` with `FileChannel` + `ReentrantLock`** — eliminate virtual-thread carrier pinning during SSTable reads
+- **Replication / streaming WAL** — multi-node durability
 
 ## License
 
