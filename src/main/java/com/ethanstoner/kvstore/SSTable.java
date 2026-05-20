@@ -58,6 +58,9 @@ public final class SSTable implements AutoCloseable {
     private final TreeMap<String, Long>   index;   // key -> absolute data offset
     private final int                     entryCount;
 
+    /** Optional shared LRU cache; {@code null} means no caching. */
+    private BlockCache cache;
+
     // -------------------------------------------------------------------------
     // Private constructor — use open() or write() + open()
     // -------------------------------------------------------------------------
@@ -259,6 +262,17 @@ public final class SSTable implements AutoCloseable {
     // =========================================================================
 
     /**
+     * Attaches a shared {@link BlockCache} to this SSTable. Once attached,
+     * {@link #readValueAt} checks the cache before doing a disk seek, and
+     * populates it on a miss.
+     *
+     * @param cache the shared cache, or {@code null} to detach
+     */
+    public void attachCache(BlockCache cache) {
+        this.cache = cache;
+    }
+
+    /**
      * Point lookup.
      *
      * <p>Returns {@code Optional.empty()} when the key is definitely absent
@@ -378,27 +392,32 @@ public final class SSTable implements AutoCloseable {
 
     /**
      * Reads the value (or tombstone sentinel) stored at the given absolute
-     * file offset. Synchronized on {@code raf} for thread safety.
+     * file offset. Checks the {@link BlockCache} before seeking; populates
+     * the cache on a miss. Synchronized on {@code raf} for thread safety.
      */
     private String readValueAt(long offset) throws IOException {
+        if (cache != null) {
+            String cached = cache.get(sequenceNum(), offset);
+            if (cached != null) return cached;
+        }
+        String value;
         synchronized (raf) {
             raf.seek(offset);
-
             byte op = raf.readByte();
-
-            // Skip the key.
             int kLen = raf.readUnsignedShort();
             raf.skipBytes(kLen);
-
             if (op == OP_TOMBSTONE) {
-                return Memtable.TOMBSTONE;
+                value = Memtable.TOMBSTONE;
+            } else {
+                int vLen = raf.readInt();
+                byte[] vBytes = new byte[vLen];
+                raf.readFully(vBytes);
+                value = new String(vBytes, StandardCharsets.UTF_8);
             }
-
-            // Read value.
-            int    vLen   = raf.readInt();
-            byte[] vBytes = new byte[vLen];
-            raf.readFully(vBytes);
-            return new String(vBytes, StandardCharsets.UTF_8);
         }
+        if (cache != null) {
+            cache.put(sequenceNum(), offset, value);
+        }
+        return value;
     }
 }

@@ -1,5 +1,6 @@
 package com.ethanstoner.kvstore.server;
 
+import com.ethanstoner.kvstore.BlockCache;
 import com.ethanstoner.kvstore.KvStore;
 import com.ethanstoner.kvstore.SSTable;
 
@@ -168,6 +169,16 @@ public final class KvServer implements AutoCloseable {
         }
         s.append("sstable_total_bytes:").append(totalBytes).append('\n');
         s.append("dbsize_approx:").append(approximateKeyCount()).append('\n');
+        s.append('\n');
+        s.append("# cache\n");
+        BlockCache bc = store.blockCache();
+        long total = bc.hits() + bc.misses();
+        double hitRate = total == 0 ? 0.0 : (double) bc.hits() / total;
+        s.append("block_cache_size:").append(bc.size()).append('\n');
+        s.append("block_cache_capacity:").append(bc.capacity()).append('\n');
+        s.append("block_cache_hits:").append(bc.hits()).append('\n');
+        s.append("block_cache_misses:").append(bc.misses()).append('\n');
+        s.append(String.format("block_cache_hit_rate:%.4f%n", hitRate));
         return s.toString();
     }
 }

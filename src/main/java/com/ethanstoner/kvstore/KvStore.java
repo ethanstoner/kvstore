@@ -59,6 +59,9 @@ public final class KvStore implements AutoCloseable {
     /** Background compaction thread. */
     private Thread compactionThread;
 
+    /** Shared LRU block cache — one instance for all SSTables. */
+    private final BlockCache blockCache = new BlockCache(1024);
+
     // =========================================================================
     // Constructor
     // =========================================================================
@@ -82,7 +85,9 @@ public final class KvStore implements AutoCloseable {
                      Files.newDirectoryStream(dataDir, "sst-*.db")) {
             for (Path p : ds) {
                 try {
-                    loaded.add(SSTable.open(p));
+                    SSTable sst = SSTable.open(p);
+                    sst.attachCache(blockCache);
+                    loaded.add(sst);
                 } catch (IOException e) {
                     // Skip corrupt / incomplete files.
                 }
@@ -243,6 +248,7 @@ public final class KvStore implements AutoCloseable {
         Path sstPath = SSTable.fileName(dataDir, nextSequence);
         SSTable.write(sstPath, flushing.entries());
         SSTable newSst = SSTable.open(sstPath);
+        newSst.attachCache(blockCache);
 
         // Atomically extend the sstables list.
         List<SSTable> current = new ArrayList<>(sstables);
@@ -350,6 +356,7 @@ public final class KvStore implements AutoCloseable {
             Path mergedPath = SSTable.fileName(dataDir, nextSequence++);
             SSTable.write(mergedPath, merged.entrySet());
             SSTable mergedSst = SSTable.open(mergedPath);
+            mergedSst.attachCache(blockCache);
 
             List<SSTable> newList = new ArrayList<>(sstables);
             for (SSTable old : toCompact) {
@@ -378,6 +385,9 @@ public final class KvStore implements AutoCloseable {
     public long memtableApproximateBytes() {
         return memtable.approximateBytes();
     }
+
+    /** @return the shared block cache used by all SSTables in this store. */
+    public BlockCache blockCache() { return blockCache; }
 
     // =========================================================================
     // AutoCloseable

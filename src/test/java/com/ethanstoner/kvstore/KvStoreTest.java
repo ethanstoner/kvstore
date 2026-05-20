@@ -222,4 +222,30 @@ class KvStoreTest {
             assertFalse(store.deleteIfPresent("k"));
         }
     }
+
+    @Test
+    void repeatedReadsHitBlockCache(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("hot-key", "hot-value");
+            // Force flush so the key lives in an SSTable
+            String bigValue = "x".repeat(100);
+            for (int i = 0; i < 20_000; i++) {
+                store.put("filler-" + String.format("%06d", i), bigValue);
+            }
+
+            // First read populates the cache (was a miss)
+            store.get("hot-key");
+            long missesAfterFirst = store.blockCache().misses();
+
+            // Next reads should be hits
+            for (int i = 0; i < 100; i++) {
+                assertEquals(Optional.of("hot-value"), store.get("hot-key"));
+            }
+            long hits = store.blockCache().hits();
+            long misses = store.blockCache().misses();
+
+            assertEquals(missesAfterFirst, misses, "no new misses on repeat reads");
+            assertTrue(hits >= 100, "expected >=100 hits, got " + hits);
+        }
+    }
 }
