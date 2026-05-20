@@ -40,6 +40,8 @@ public final class KvServer implements AutoCloseable {
     private final UserStore users;
     private final TlsConfig tls;
 
+    private final PubSubHub pubSubHub = new PubSubHub();
+
     private final Set<ClientConnection> activeConnections =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final ExecutorService connExecutor =
@@ -74,6 +76,8 @@ public final class KvServer implements AutoCloseable {
         this.users = users;
         this.tls = tls;
     }
+
+    public PubSubHub pubSubHub() { return pubSubHub; }
 
     public boolean isAuthRequired() { return users.isAuthRequired(); }
 
