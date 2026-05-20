@@ -49,32 +49,40 @@ public final class KvServer implements AutoCloseable {
     private final AtomicLong commandsProcessed = new AtomicLong();
     private final AtomicLong connectionsReceived = new AtomicLong();
     private final long startNanos = System.nanoTime();
+    private final int maxConnections;
+    private final AtomicLong rejectedConnections = new AtomicLong();
+    private final AtomicLong peakConnections = new AtomicLong();
 
     private volatile ServerSocket serverSocket;
     private volatile Thread acceptThread;
     private volatile boolean running;
 
     public KvServer(KvStore store, int port) {
-        this(store, port, UserStore.empty(), null);
+        this(store, port, UserStore.empty(), null, 0);
     }
 
     public KvServer(KvStore store, int port, String requirePassword) {
         this(store, port, requirePassword == null
                 ? UserStore.empty()
-                : UserStore.singleDefault(requirePassword), null);
+                : UserStore.singleDefault(requirePassword), null, 0);
     }
 
     public KvServer(KvStore store, int port, String requirePassword, TlsConfig tls) {
         this(store, port, requirePassword == null
                 ? UserStore.empty()
-                : UserStore.singleDefault(requirePassword), tls);
+                : UserStore.singleDefault(requirePassword), tls, 0);
     }
 
     public KvServer(KvStore store, int port, UserStore users, TlsConfig tls) {
+        this(store, port, users, tls, 0);
+    }
+
+    public KvServer(KvStore store, int port, UserStore users, TlsConfig tls, int maxConnections) {
         this.store = store;
         this.requestedPort = port;
         this.users = users;
         this.tls = tls;
+        this.maxConnections = maxConnections;
     }
 
     public PubSubHub pubSubHub() { return pubSubHub; }
@@ -128,6 +136,14 @@ public final class KvServer implements AutoCloseable {
                 if (!running) return;
                 continue;
             }
+
+            // Connection limit check
+            if (maxConnections > 0 && activeConnections.size() >= maxConnections) {
+                rejectedConnections.incrementAndGet();
+                try { client.close(); } catch (IOException ignored) {}
+                continue;
+            }
+
             connectionsReceived.incrementAndGet();
             connExecutor.submit(new ClientConnection(client, this, handler));
         }
@@ -167,7 +183,11 @@ public final class KvServer implements AutoCloseable {
 
     public boolean isRunning() { return running; }
 
-    void registerConnection(ClientConnection c) { activeConnections.add(c); }
+    void registerConnection(ClientConnection c) {
+        activeConnections.add(c);
+        long size = activeConnections.size();
+        peakConnections.updateAndGet(prev -> Math.max(prev, size));
+    }
     void unregisterConnection(ClientConnection c) { activeConnections.remove(c); }
     void recordCommand() { commandsProcessed.incrementAndGet(); }
 
@@ -191,6 +211,8 @@ public final class KvServer implements AutoCloseable {
         s.append("total_commands_processed:").append(commandsProcessed.get()).append('\n');
         s.append("total_connections_received:").append(connectionsReceived.get()).append('\n');
         s.append("connected_clients:").append(activeConnections.size()).append('\n');
+        s.append("rejected_connections:").append(rejectedConnections.get()).append('\n');
+        s.append("peak_concurrent_connections:").append(peakConnections.get()).append('\n');
         s.append('\n');
         s.append("# storage\n");
         s.append("memtable_bytes:").append(store.memtableApproximateBytes()).append('\n');
@@ -212,6 +234,9 @@ public final class KvServer implements AutoCloseable {
         s.append("block_cache_hits:").append(bc.hits()).append('\n');
         s.append("block_cache_misses:").append(bc.misses()).append('\n');
         s.append(String.format("block_cache_hit_rate:%.4f%n", hitRate));
+        s.append('\n');
+        s.append("# limits\n");
+        s.append("max_connections:").append(maxConnections > 0 ? maxConnections : "unlimited").append('\n');
         return s.toString();
     }
 }

@@ -21,6 +21,7 @@ public final class ServeCommand {
         boolean anyUsers = false;
         Path tlsKeystorePath = null;
         String tlsKeystorePass = null;
+        int maxConnections = 0;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -55,6 +56,15 @@ public final class ServeCommand {
                     if (++i >= args.length) { usage(); return; }
                     tlsKeystorePass = args[i];
                 }
+                case "--max-connections" -> {
+                    if (++i >= args.length) { usage(); return; }
+                    try {
+                        maxConnections = Integer.parseInt(args[i]);
+                    } catch (NumberFormatException e) {
+                        System.err.println("--max-connections must be an integer");
+                        return;
+                    }
+                }
                 case "--help", "-h" -> { usage(); return; }
                 default -> {
                     System.err.println("Unknown arg: " + args[i]);
@@ -82,7 +92,7 @@ public final class ServeCommand {
         }
 
         KvStore store = new KvStore(dataDir);
-        KvServer server = new KvServer(store, port, users, tls);
+        KvServer server = new KvServer(store, port, users, tls, maxConnections);
         server.start();
         System.out.println("kvstore server listening on " + server.port()
                 + (tls != null ? " [TLS]" : "")
@@ -102,6 +112,7 @@ public final class ServeCommand {
         System.out.println("""
                 kvstore serve [--port PORT] [--data DIR] [--requirepass PASSWORD]
                               [--user name:password] [--tls-keystore PATH] [--tls-keystore-pass PASS]
+                              [--max-connections N]
                   --port               port to listen on (default 6379)
                   --data               data directory (default ./kvdata)
                   --requirepass        single-password mode: require AUTH <password> (the "default" user)
@@ -110,6 +121,7 @@ public final class ServeCommand {
                                        --requirepass and --user can be combined; --requirepass sets "default"
                   --tls-keystore       path to a JKS keystore for TLS (enables TLS mode)
                   --tls-keystore-pass  password for the JKS keystore (default: empty)
+                  --max-connections    maximum concurrent connections allowed (0 = unlimited, default 0)
 
                 TLS mode: when --tls-keystore is provided the server accepts only TLS
                 connections on the configured port. Use redis-cli --tls to connect.
