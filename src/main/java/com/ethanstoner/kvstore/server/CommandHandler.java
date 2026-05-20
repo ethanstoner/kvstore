@@ -6,6 +6,7 @@ import com.ethanstoner.kvstore.server.resp.RespWriter;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -36,6 +37,19 @@ public final class CommandHandler {
             return;
         }
         String cmd = args[0].toUpperCase(Locale.ROOT);
+
+        // Subscribed-mode gate: only a subset of commands allowed when subscribed
+        if (auth instanceof ClientConnection cc && cc.isInSubscribeMode()) {
+            switch (cmd) {
+                case "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE",
+                     "PING", "QUIT" -> { /* allowed — fall through to main switch */ }
+                default -> {
+                    RespWriter.writeError(out,
+                            "ERR Can't execute '" + cmd + "' in subscribe context, only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed");
+                    return;
+                }
+            }
+        }
 
         // Pre-auth gate
         if (!auth.isAuthenticated()) {
@@ -71,10 +85,15 @@ public final class CommandHandler {
                 case "TTL"      -> ttl(args, out, false);
                 case "PTTL"     -> ttl(args, out, true);
                 case "PERSIST"  -> persist(args, out);
-                case "COMMAND"  -> RespWriter.writeArray(out, List.of());
-                case "QUIT"     -> RespWriter.writeSimpleString(out, "OK");
-                case "SHUTDOWN" -> shutdown(out);
-                default         -> RespWriter.writeError(out,
+                case "COMMAND"      -> RespWriter.writeArray(out, List.of());
+                case "QUIT"         -> RespWriter.writeSimpleString(out, "OK");
+                case "SHUTDOWN"     -> shutdown(out);
+                case "SUBSCRIBE"    -> subscribe(args, out, auth, false);
+                case "UNSUBSCRIBE"  -> unsubscribe(args, out, auth, false);
+                case "PSUBSCRIBE"   -> subscribe(args, out, auth, true);
+                case "PUNSUBSCRIBE" -> unsubscribe(args, out, auth, true);
+                case "PUBLISH"      -> publish(args, out);
+                default             -> RespWriter.writeError(out,
                         "ERR unknown command '" + args[0] + "'");
             }
         } catch (IOException e) {
@@ -281,6 +300,73 @@ public final class CommandHandler {
         if (args.length != 2) { wrongArity(out, "PERSIST"); return; }
         boolean removed = store.persist(args[1]);
         RespWriter.writeInteger(out, removed ? 1 : 0);
+    }
+
+    // ── Pub/Sub commands ─────────────────────────────────────────────────────
+
+    private void subscribe(String[] args, OutputStream out, AuthState auth, boolean isPattern) throws IOException {
+        if (args.length < 2) { wrongArity(out, isPattern ? "PSUBSCRIBE" : "SUBSCRIBE"); return; }
+        if (!(auth instanceof ClientConnection cc)) {
+            RespWriter.writeError(out, "ERR pub/sub requires a real client connection");
+            return;
+        }
+        PubSubHub hub = server.pubSubHub();
+        String tag = isPattern ? "psubscribe" : "subscribe";
+        for (int i = 1; i < args.length; i++) {
+            String target = args[i];
+            if (isPattern) { hub.psubscribe(target, cc); cc.addPattern(target); }
+            else           { hub.subscribe(target, cc);  cc.addChannel(target); }
+            // Write 3-element array with integer count as 3rd element
+            writePubSubReply(out, tag, target, cc.subscribedCount());
+        }
+    }
+
+    private void unsubscribe(String[] args, OutputStream out, AuthState auth, boolean isPattern) throws IOException {
+        if (!(auth instanceof ClientConnection cc)) {
+            RespWriter.writeError(out, "ERR pub/sub requires a real client connection");
+            return;
+        }
+        PubSubHub hub = server.pubSubHub();
+        String tag = isPattern ? "punsubscribe" : "unsubscribe";
+
+        List<String> targets = new ArrayList<>();
+        if (args.length >= 2) {
+            for (int i = 1; i < args.length; i++) targets.add(args[i]);
+        } else {
+            // No args: unsubscribe from all
+            targets.addAll(isPattern ? cc.patterns() : cc.channels());
+        }
+
+        if (targets.isEmpty()) {
+            // Special case: nothing to unsubscribe from — reply with null channel
+            out.write('*');
+            out.write("3\r\n".getBytes(StandardCharsets.UTF_8));
+            RespWriter.writeBulkString(out, tag);
+            RespWriter.writeBulkString(out, null);
+            RespWriter.writeInteger(out, 0);
+            return;
+        }
+
+        for (String target : targets) {
+            if (isPattern) { hub.punsubscribe(target, cc); cc.removePattern(target); }
+            else           { hub.unsubscribe(target, cc);  cc.removeChannel(target); }
+            writePubSubReply(out, tag, target, cc.subscribedCount());
+        }
+    }
+
+    private void publish(String[] args, OutputStream out) throws IOException {
+        if (args.length != 3) { wrongArity(out, "PUBLISH"); return; }
+        int n = server.pubSubHub().publish(args[1], args[2]);
+        RespWriter.writeInteger(out, n);
+    }
+
+    /** Writes a 3-element pub/sub reply array: [tag, target, intCount]. */
+    private static void writePubSubReply(OutputStream out, String tag, String target, int count) throws IOException {
+        out.write('*');
+        out.write("3\r\n".getBytes(StandardCharsets.UTF_8));
+        RespWriter.writeBulkString(out, tag);
+        RespWriter.writeBulkString(out, target);
+        RespWriter.writeInteger(out, count);
     }
 
     private static void wrongArity(OutputStream out, String cmd) throws IOException {
