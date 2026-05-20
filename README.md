@@ -115,7 +115,10 @@ Every write is logged to disk **before** it is applied in memory — that orderi
 
 - **Redis wire-protocol compatible** — connect with `redis-cli`, `redis-py`, `Jedis`, or any Redis client library
 - **TLS encryption** — optional `SSLServerSocket` via `--tls-keystore`, TLSv1.3
-- **Multi-user authentication** — Redis 6-style `AUTH <user> <pass>`, multiple users via `--user`, constant-time password comparison
+- **Multi-user authentication + ACLs** — Redis 6-style `AUTH <user> <pass>`, multiple users via `--user name:pass[:cmd1,cmd2,...]`, per-user command allowlists, constant-time password comparison
+- **Pub/Sub** — `SUBSCRIBE`, `PSUBSCRIBE`, `PUBLISH` with glob-pattern matching; subscribed connections receive async messages
+- **Snapshots** — `BGSAVE` / `SAVE` / `LASTSAVE` produce point-in-time backup files (reusing the SSTable format)
+- **Connection limits** — `--max-connections` flag rejects connections beyond the threshold; INFO tracks peak concurrent + rejected counts
 - **Virtual-thread server** — Java 21 vthreads, one per connection, scales to thousands of concurrent clients. SSTable reads use `FileChannel` positional reads (no carrier pinning)
 - **Durable writes** — write-ahead log with fsync and **CRC32 per record** for corruption detection
 - **SSTable flush** — memtable spills to immutable sorted files when full
@@ -189,7 +192,9 @@ java -jar target/kvstore-0.1.0.jar serve                              # port 637
 java -jar target/kvstore-0.1.0.jar serve --port 6380                  # different port
 java -jar target/kvstore-0.1.0.jar serve --data /var/kv               # different data dir
 java -jar target/kvstore-0.1.0.jar serve --requirepass topsecret      # single password
-java -jar target/kvstore-0.1.0.jar serve --user alice:s1 --user bob:s2  # multi-user ACL
+java -jar target/kvstore-0.1.0.jar serve --user alice:s1 --user bob:s2  # multi-user
+java -jar target/kvstore-0.1.0.jar serve --user reader:s1:GET,EXISTS,MGET   # read-only ACL
+java -jar target/kvstore-0.1.0.jar serve --max-connections 1000             # connection cap
 java -jar target/kvstore-0.1.0.jar serve --tls-keystore kv.jks --tls-keystore-pass changeit  # TLS
 
 # In another terminal — works with any Redis client:
@@ -209,7 +214,14 @@ redis-cli -p 6379 get hello                           # (error) NOAUTH Authentic
 redis-cli -p 6379 --tls --cacert ca.crt ping          # encrypted handshake
 ```
 
-Supported commands: `AUTH`, `PING`, `SET` (with `EX`/`PX`), `GET`, `DEL`, `EXISTS`, `MGET`, `MSET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `SCAN from to` (range scan, not cursor), `DBSIZE`, `INFO`, `COMMAND`, `QUIT`, `SHUTDOWN`.
+Supported commands:
+- **Keys/strings**: `SET` (with `EX`/`PX`), `GET`, `DEL`, `EXISTS`, `MGET`, `MSET`
+- **Numeric**: `INCR`, `DECR`, `INCRBY`, `DECRBY`
+- **TTL**: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`
+- **Pub/Sub**: `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`
+- **Snapshot**: `SAVE`, `BGSAVE`, `LASTSAVE`
+- **Scan**: `SCAN from to` (range scan, not cursor)
+- **Server**: `AUTH`, `PING`, `DBSIZE`, `INFO`, `COMMAND`, `QUIT`, `SHUTDOWN`
 
 ### As an embedded one-shot CLI
 
@@ -258,11 +270,16 @@ src/main/java/com/ethanstoner/kvstore/
   SSTable.java           immutable sorted file (binary format + bloom filter + index)
   BloomFilter.java       probabilistic set membership (MurmurHash3)
   BlockCache.java        thread-safe LRU value cache shared across SSTables
-  KvStore.java           ties it together; public API + flush + compaction
+  KvStore.java           ties it together; public API + flush + compaction + snapshots
+  ValueEntry.java        record holding value + expiration timestamp (TTL)
   server/
-    KvServer.java        TCP server, accept loop, graceful shutdown
-    ClientConnection.java  per-connection vthread loop
-    CommandHandler.java  dispatches RESP commands to KvStore
+    KvServer.java        TCP server, accept loop, graceful shutdown, connection limits
+    ClientConnection.java  per-connection vthread loop, subscribe state, auth state
+    CommandHandler.java  dispatches RESP commands to KvStore + PubSubHub
+    PubSubHub.java       channel/pattern subscription routing
+    UserStore.java       users + passwords + per-user command allowlists
+    AuthState.java       interface implemented by ClientConnection
+    TlsConfig.java       TLSv1.3 keystore loader
     resp/
       RespParser.java    reads RESP frames (5 types + inline form)
       RespWriter.java    writes RESP responses
@@ -282,8 +299,9 @@ src/test/java/...        JUnit 5 suite: memtable, WAL, SSTable, bloom filter,
 
 Potential future work:
 
+- **Replication / streaming WAL** — master/replica protocol for multi-node durability
+- **Sharding** — multiple nodes, hashed key range partitioning
 - **Block-level (not per-value) compression** — better ratio for small values
-- **Per-user permissions** — read-only / write-only / command allowlists on top of multi-user AUTH
 - **Replication / streaming WAL** — multi-node durability via a follower protocol
 - **Sharding** — multiple nodes, hashed key range partitioning
 
