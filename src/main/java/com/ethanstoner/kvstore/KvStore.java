@@ -232,6 +232,44 @@ public final class KvStore implements AutoCloseable {
     }
 
     /**
+     * Atomic increment-or-create. Reads the current value, parses it as a
+     * 64-bit signed integer (treating missing keys as 0), adds {@code delta},
+     * and writes the result back as a string. The whole operation is
+     * serialized under {@link #flushLock}, so concurrent clients see
+     * race-free counters.
+     *
+     * @return the new value after the increment
+     * @throws NumberFormatException if the existing value is not a valid integer
+     * @throws ArithmeticException   on signed-long overflow
+     */
+    public long incrementBy(String key, long delta) throws IOException {
+        flushLock.lock();
+        try {
+            // Read current value WITHOUT releasing the lock
+            long current = 0;
+            Optional<String> existing = get(key);
+            if (existing.isPresent()) {
+                try {
+                    current = Long.parseLong(existing.get());
+                } catch (NumberFormatException e) {
+                    throw new NumberFormatException(
+                            "value is not an integer or out of range");
+                }
+            }
+            long updated = Math.addExact(current, delta);  // throws on overflow
+
+            // Write the new value
+            String newValue = Long.toString(updated);
+            wal.appendPut(key, newValue);
+            memtable.put(key, newValue);
+            triggerFlushIfNeeded();
+            return updated;
+        } finally {
+            flushLock.unlock();
+        }
+    }
+
+    /**
      * Atomic check-and-delete: returns {@code true} if the key existed (and
      * is now deleted), {@code false} if it was already absent.
      *

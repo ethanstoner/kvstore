@@ -59,6 +59,10 @@ public final class CommandHandler {
                 case "MGET"     -> mget(args, out);
                 case "MSET"     -> mset(args, out);
                 case "SCAN"     -> scan(args, out);
+                case "INCR"     -> incrBy(args, out, 1, "INCR", 2);
+                case "DECR"     -> incrBy(args, out, -1, "DECR", 2);
+                case "INCRBY"   -> incrByWithArg(args, out, "INCRBY", false);
+                case "DECRBY"   -> incrByWithArg(args, out, "DECRBY", true);
                 case "DBSIZE"   -> dbsize(args, out);
                 case "INFO"     -> info(args, out);
                 case "COMMAND"  -> RespWriter.writeArray(out, List.of());
@@ -195,6 +199,38 @@ public final class CommandHandler {
         new Thread(() -> {
             try { server.stop(); } catch (IOException ignored) {}
         }, "kvstore-shutdown").start();
+    }
+
+    private void incrBy(String[] args, OutputStream out, long delta, String cmd, int expectedArity) throws IOException {
+        if (args.length != expectedArity) { wrongArity(out, cmd); return; }
+        try {
+            long result = store.incrementBy(args[1], delta);
+            RespWriter.writeInteger(out, result);
+        } catch (NumberFormatException e) {
+            RespWriter.writeError(out, "ERR value is not an integer or out of range");
+        } catch (ArithmeticException e) {
+            RespWriter.writeError(out, "ERR increment or decrement would overflow");
+        }
+    }
+
+    private void incrByWithArg(String[] args, OutputStream out, String cmd, boolean negate) throws IOException {
+        if (args.length != 3) { wrongArity(out, cmd); return; }
+        long delta;
+        try {
+            delta = Long.parseLong(args[2]);
+        } catch (NumberFormatException e) {
+            RespWriter.writeError(out, "ERR value is not an integer or out of range");
+            return;
+        }
+        if (negate) delta = -delta;  // for DECRBY
+        try {
+            long result = store.incrementBy(args[1], delta);
+            RespWriter.writeInteger(out, result);
+        } catch (NumberFormatException e) {
+            RespWriter.writeError(out, "ERR value is not an integer or out of range");
+        } catch (ArithmeticException e) {
+            RespWriter.writeError(out, "ERR increment or decrement would overflow");
+        }
     }
 
     private static void wrongArity(OutputStream out, String cmd) throws IOException {

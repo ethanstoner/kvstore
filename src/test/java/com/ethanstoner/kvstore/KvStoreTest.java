@@ -10,6 +10,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class KvStoreTest {
@@ -230,6 +231,74 @@ class KvStoreTest {
             store.put("k", "v");
             store.delete("k");
             assertFalse(store.deleteIfPresent("k"));
+        }
+    }
+
+    @Test
+    void incrementByCreatesKeyIfAbsent(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            assertEquals(5L, store.incrementBy("counter", 5));
+            assertEquals(Optional.of("5"), store.get("counter"));
+        }
+    }
+
+    @Test
+    void incrementByExistingIntegerWorks(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("counter", "10");
+            assertEquals(13L, store.incrementBy("counter", 3));
+            assertEquals(Optional.of("13"), store.get("counter"));
+        }
+    }
+
+    @Test
+    void incrementByNegativeDecrements(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("counter", "100");
+            assertEquals(95L, store.incrementBy("counter", -5));
+        }
+    }
+
+    @Test
+    void incrementByNonIntegerThrows(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("name", "alice");
+            assertThrows(NumberFormatException.class,
+                    () -> store.incrementBy("name", 1));
+        }
+    }
+
+    @Test
+    void incrementByOverflowThrows(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("counter", Long.toString(Long.MAX_VALUE));
+            assertThrows(ArithmeticException.class,
+                    () -> store.incrementBy("counter", 1));
+        }
+    }
+
+    @Test
+    void concurrentIncrementsAreAtomic(@TempDir Path dir) throws Exception {
+        try (KvStore store = new KvStore(dir)) {
+            int writers = 10;
+            int incrementsPerWriter = 100;
+            java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(writers);
+            for (int w = 0; w < writers; w++) {
+                Thread.startVirtualThread(() -> {
+                    try {
+                        for (int i = 0; i < incrementsPerWriter; i++) {
+                            store.incrementBy("counter", 1);
+                        }
+                    } catch (IOException ignored) {
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            assertTrue(done.await(30, java.util.concurrent.TimeUnit.SECONDS));
+            // Final value MUST be exactly writers * incrementsPerWriter
+            assertEquals(Optional.of(Integer.toString(writers * incrementsPerWriter)),
+                    store.get("counter"));
         }
     }
 
