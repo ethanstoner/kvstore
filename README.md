@@ -74,15 +74,17 @@ Every write is logged to disk **before** it is applied in memory — that orderi
 ## Features
 
 - **Redis wire-protocol compatible** — connect with `redis-cli`, `redis-py`, `Jedis`, or any Redis client library
+- **Password authentication** — `AUTH` command, constant-time comparison, `--requirepass` flag
 - **Virtual-thread server** — Java 21 vthreads, one per connection, scales to thousands of concurrent clients
-- **Durable writes** — write-ahead log with fsync; data survives crashes
+- **Durable writes** — write-ahead log with fsync and **CRC32 per record** for corruption detection
 - **SSTable flush** — memtable spills to immutable sorted files when full
 - **Multi-level reads** — get/scan falls through memtable → newest SSTable → older ones
 - **Bloom filters** — probabilistic filter per SSTable skips files that can't contain a key (~1% false positive rate)
+- **LRU block cache** — value cache shared across SSTables; hot reads skip the disk seek entirely
 - **Size-tiered compaction** — background thread merges SSTables of similar size, drops tombstones
 - **Atomic DEL** — check-and-delete under the write lock; concurrent clients see accurate counts
 - **Range scans** — ordered `[from, to)` scans merged across all levels
-- **Crash recovery** — replays WAL on startup, skips corrupt SSTable files
+- **Crash recovery** — replays WAL on startup (stops at first corrupt record), skips corrupt SSTable files
 - **JMH benchmarks** — measure write/read/scan throughput
 
 ## Complexity
@@ -108,20 +110,25 @@ mvn package                   # build target/kvstore-0.1.0.jar
 ### As a network server (Redis-compatible)
 
 ```bash
-java -jar target/kvstore-0.1.0.jar serve                     # port 6379
-java -jar target/kvstore-0.1.0.jar serve --port 6380         # different port
-java -jar target/kvstore-0.1.0.jar serve --data /var/kv      # different data dir
+java -jar target/kvstore-0.1.0.jar serve                              # port 6379, no auth
+java -jar target/kvstore-0.1.0.jar serve --port 6380                  # different port
+java -jar target/kvstore-0.1.0.jar serve --data /var/kv               # different data dir
+java -jar target/kvstore-0.1.0.jar serve --requirepass topsecret      # require AUTH
 
 # In another terminal — works with any Redis client:
-redis-cli -p 6379 ping                  # PONG
-redis-cli -p 6379 set hello world       # OK
-redis-cli -p 6379 get hello             # "world"
-redis-cli -p 6379 mget hello missing    # 1) "world"  2) (nil)
-redis-cli -p 6379 info                  # server / stats / storage sections
-redis-cli -p 6379 shutdown              # graceful stop
+redis-cli -p 6379 ping                       # PONG
+redis-cli -p 6379 set hello world            # OK
+redis-cli -p 6379 get hello                  # "world"
+redis-cli -p 6379 mget hello missing         # 1) "world"  2) (nil)
+redis-cli -p 6379 info                       # server / stats / storage / cache
+redis-cli -p 6379 shutdown                   # graceful stop
+
+# With auth:
+redis-cli -p 6379 -a topsecret get hello     # authenticated
+redis-cli -p 6379 get hello                  # (error) NOAUTH Authentication required.
 ```
 
-Supported commands: `PING`, `SET`, `GET`, `DEL`, `EXISTS`, `MGET`, `MSET`, `SCAN from to` (range scan, not cursor), `DBSIZE`, `INFO`, `COMMAND`, `QUIT`, `SHUTDOWN`.
+Supported commands: `AUTH`, `PING`, `SET`, `GET`, `DEL`, `EXISTS`, `MGET`, `MSET`, `SCAN from to` (range scan, not cursor), `DBSIZE`, `INFO`, `COMMAND`, `QUIT`, `SHUTDOWN`.
 
 ### As an embedded one-shot CLI
 
@@ -169,6 +176,7 @@ src/main/java/com/ethanstoner/kvstore/
   WriteAheadLog.java     append-only durability + replay
   SSTable.java           immutable sorted file (binary format + bloom filter + index)
   BloomFilter.java       probabilistic set membership (MurmurHash3)
+  BlockCache.java        thread-safe LRU value cache shared across SSTables
   KvStore.java           ties it together; public API + flush + compaction
   server/
     KvServer.java        TCP server, accept loop, graceful shutdown
@@ -191,13 +199,13 @@ src/test/java/...        JUnit 5 suite: memtable, WAL, SSTable, bloom filter,
 
 ## Roadmap
 
-Potential future work (Phase 2):
+Potential future work:
 
-- **WAL checksums** — CRC32 per record, detect partial/corrupt WAL entries on replay
-- **Block cache** — LRU cache for frequently-read SSTable values
 - **Compression** — Snappy or LZ4 per SSTable
 - **Concurrent flush** — immutable memtable during flush so writes don't stall
 - **Leveled compaction** — non-overlapping key ranges per level for better read amplification at scale
+- **TLS** — encrypted transport for production deployments
+- **ACL with usernames** — Redis 6+ style multi-user authentication
 - **Replace `synchronized` with `FileChannel` + `ReentrantLock`** — eliminate virtual-thread carrier pinning during SSTable reads
 
 ## License

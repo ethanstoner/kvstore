@@ -7,3 +7,4 @@ kvdata/
 .DS_Store
 docs/plans/
 docs/specs/
+dependency-reduced-pom.xml
