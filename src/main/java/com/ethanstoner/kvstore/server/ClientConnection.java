@@ -12,17 +12,25 @@ import java.net.Socket;
 import java.net.SocketException;
 
 /** One per accepted TCP connection. Runs in its own virtual thread. */
-final class ClientConnection implements Runnable {
+final class ClientConnection implements Runnable, AuthState {
 
     private final Socket socket;
     private final KvServer server;
     private final CommandHandler handler;
+    private boolean authenticated;
 
     ClientConnection(Socket socket, KvServer server, CommandHandler handler) {
         this.socket = socket;
         this.server = server;
         this.handler = handler;
+        this.authenticated = !server.isAuthRequired();
     }
+
+    @Override
+    public boolean isAuthenticated() { return authenticated; }
+
+    @Override
+    public void markAuthenticated() { this.authenticated = true; }
 
     @Override
     public void run() {
@@ -39,7 +47,7 @@ final class ClientConnection implements Runnable {
                 }
                 if (cmd == null) return;
 
-                handler.handle(cmd, out);
+                handler.handle(cmd, out, this);
                 out.flush();
                 server.recordCommand();
 

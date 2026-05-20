@@ -14,13 +14,22 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class CommandHandlerTest {
 
+    /** Mutable auth stub used by tests; starts authenticated so existing tests are unaffected. */
+    static class AuthStub implements AuthState {
+        boolean authed = true;
+        @Override public boolean isAuthenticated() { return authed; }
+        @Override public void markAuthenticated() { authed = true; }
+    }
+
     KvStore store;
     CommandHandler handler;
+    AuthStub auth = new AuthStub();
 
     @BeforeEach
     void setUp(@TempDir Path dir) throws IOException {
         store = new KvStore(dir);
         handler = new CommandHandler(store, new KvServer(store, 0));
+        auth = new AuthStub(); // reset per test
     }
 
     @AfterEach
@@ -30,7 +39,7 @@ class CommandHandlerTest {
 
     private String run(String... args) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        handler.handle(args, out);
+        handler.handle(args, out, auth);
         return out.toString("UTF-8");
     }
 
@@ -157,5 +166,81 @@ class CommandHandlerTest {
     void caseInsensitiveCommands() throws IOException {
         run("set", "k", "v");
         assertEquals("$1\r\nv\r\n", run("get", "k"));
+    }
+
+    // ── AUTH tests ──────────────────────────────────────────────────────────
+
+    @Test
+    void authCommandWithoutPasswordConfigReturnsError() throws IOException {
+        // Server constructed without password — AUTH should error
+        String result = run("AUTH", "anything");
+        assertTrue(result.startsWith("-ERR"), result);
+        assertTrue(result.contains("no password"), result);
+    }
+
+    @Test
+    void noauthBlocksCommandsWhenAuthRequired(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            KvServer authServer = new KvServer(s, 0, "secret");
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+            AuthStub unauth = new AuthStub();
+            unauth.authed = false;
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"SET", "k", "v"}, out, unauth);
+            String reply = out.toString("UTF-8");
+            assertTrue(reply.startsWith("-NOAUTH"), reply);
+        }
+    }
+
+    @Test
+    void successfulAuthUnlocksCommands(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            KvServer authServer = new KvServer(s, 0, "secret");
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+            AuthStub unauth = new AuthStub();
+            unauth.authed = false;
+
+            // AUTH first
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"AUTH", "secret"}, out, unauth);
+            assertEquals("+OK\r\n", out.toString("UTF-8"));
+            assertTrue(unauth.authed, "connection should now be authenticated");
+
+            // Now SET works
+            out.reset();
+            authHandler.handle(new String[]{"SET", "k", "v"}, out, unauth);
+            assertEquals("+OK\r\n", out.toString("UTF-8"));
+        }
+    }
+
+    @Test
+    void wrongPasswordIsRejected(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            KvServer authServer = new KvServer(s, 0, "secret");
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+            AuthStub unauth = new AuthStub();
+            unauth.authed = false;
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"AUTH", "wrong"}, out, unauth);
+            String reply = out.toString("UTF-8");
+            assertTrue(reply.startsWith("-WRONGPASS"), reply);
+            assertFalse(unauth.authed, "connection should still be unauthenticated");
+        }
+    }
+
+    @Test
+    void pingAllowedBeforeAuth(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            KvServer authServer = new KvServer(s, 0, "secret");
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+            AuthStub unauth = new AuthStub();
+            unauth.authed = false;
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"PING"}, out, unauth);
+            assertEquals("+PONG\r\n", out.toString("UTF-8"));
+        }
     }
 }

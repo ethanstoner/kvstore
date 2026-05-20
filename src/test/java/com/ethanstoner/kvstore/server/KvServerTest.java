@@ -207,4 +207,50 @@ class KvServerTest {
             try (Socket s = new Socket("127.0.0.1", port)) { s.getOutputStream().write(1); }
         });
     }
+
+    // ── AUTH integration tests ──────────────────────────────────────────────
+
+    @Test
+    void authRequiredBlocksUnauthClients(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir);
+             KvServer server = new KvServer(store, 0, "topsecret")) {
+            server.start();
+            int port = server.port();
+
+            // Unauth SET → NOAUTH
+            String reply = roundTrip(port, new String[]{"SET", "k", "v"});
+            assertTrue(reply.startsWith("-NOAUTH"), reply);
+        }
+    }
+
+    @Test
+    void authSuccessThenWriteWorks(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir);
+             KvServer server = new KvServer(store, 0, "topsecret")) {
+            server.start();
+            int port = server.port();
+            // AUTH and SET must share the same connection
+            try (java.net.Socket sock = new java.net.Socket("127.0.0.1", port)) {
+                sock.setSoTimeout(3000);
+                sendResp(sock, new String[]{"AUTH", "topsecret"});
+                String authReply = readOneRespReply(sock.getInputStream());
+                assertEquals("+OK\r\n", authReply);
+
+                sendResp(sock, new String[]{"SET", "k", "v"});
+                String setReply = readOneRespReply(sock.getInputStream());
+                assertEquals("+OK\r\n", setReply);
+            }
+        }
+    }
+
+    private static void sendResp(java.net.Socket sock, String[] cmd) throws IOException {
+        StringBuilder req = new StringBuilder();
+        req.append('*').append(cmd.length).append("\r\n");
+        for (String a : cmd) {
+            byte[] b = a.getBytes(StandardCharsets.UTF_8);
+            req.append('$').append(b.length).append("\r\n").append(a).append("\r\n");
+        }
+        sock.getOutputStream().write(req.toString().getBytes(StandardCharsets.UTF_8));
+        sock.getOutputStream().flush();
+    }
 }

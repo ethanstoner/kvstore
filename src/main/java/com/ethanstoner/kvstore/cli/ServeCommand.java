@@ -13,6 +13,7 @@ public final class ServeCommand {
     public static void run(String[] args) throws IOException, InterruptedException {
         int port = 6379;
         Path dataDir = Path.of("kvdata");
+        String password = null;
 
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
@@ -24,6 +25,10 @@ public final class ServeCommand {
                     if (++i >= args.length) { usage(); return; }
                     dataDir = Path.of(args[i]);
                 }
+                case "--requirepass" -> {
+                    if (++i >= args.length) { usage(); return; }
+                    password = args[i];
+                }
                 case "--help", "-h" -> { usage(); return; }
                 default -> {
                     System.err.println("Unknown arg: " + args[i]);
@@ -34,7 +39,7 @@ public final class ServeCommand {
         }
 
         KvStore store = new KvStore(dataDir);
-        KvServer server = new KvServer(store, port);
+        KvServer server = new KvServer(store, port, password);
         server.start();
         System.out.println("kvstore server listening on " + server.port()
                 + " (data dir: " + dataDir.toAbsolutePath() + ")");
@@ -51,9 +56,10 @@ public final class ServeCommand {
 
     private static void usage() {
         System.out.println("""
-                kvstore serve [--port PORT] [--data DIR]
-                  --port  port to listen on (default 6379)
-                  --data  data directory (default ./kvdata)
+                kvstore serve [--port PORT] [--data DIR] [--requirepass PASSWORD]
+                  --port          port to listen on (default 6379)
+                  --data          data directory (default ./kvdata)
+                  --requirepass   require AUTH <password> before commands (default: no auth)
                 """);
     }
 }

@@ -24,14 +24,33 @@ public final class CommandHandler {
         this.server = server;
     }
 
-    public void handle(String[] args, OutputStream out) throws IOException {
+    /** Test-only convenience: handle a command on an already-authenticated stub connection. */
+    void handle(String[] args, OutputStream out) throws IOException {
+        handle(args, out, ALWAYS_AUTHED);
+    }
+
+    public void handle(String[] args, OutputStream out, AuthState auth) throws IOException {
         if (args.length == 0) {
             RespWriter.writeError(out, "ERR empty command");
             return;
         }
         String cmd = args[0].toUpperCase(Locale.ROOT);
+
+        // Pre-auth gate
+        if (!auth.isAuthenticated()) {
+            if (cmd.equals("AUTH")) {
+                auth(args, out, auth);
+                return;
+            }
+            if (!cmd.equals("PING") && !cmd.equals("QUIT") && !cmd.equals("COMMAND")) {
+                RespWriter.writeError(out, "NOAUTH Authentication required.");
+                return;
+            }
+        }
+
         try {
             switch (cmd) {
+                case "AUTH"     -> auth(args, out, auth);
                 case "PING"     -> ping(args, out);
                 case "SET"      -> set(args, out);
                 case "GET"      -> get(args, out);
@@ -51,6 +70,30 @@ public final class CommandHandler {
         } catch (IOException e) {
             if (e instanceof java.net.SocketException) throw e;
             RespWriter.writeError(out, "ERR internal: " + e.getMessage());
+        }
+    }
+
+    private static final AuthState ALWAYS_AUTHED = new AuthState() {
+        @Override public boolean isAuthenticated() { return true; }
+        @Override public void markAuthenticated() {}
+    };
+
+    private void auth(String[] args, OutputStream out, AuthState auth) throws IOException {
+        if (args.length != 2) {
+            wrongArity(out, "AUTH");
+            return;
+        }
+        if (!server.isAuthRequired()) {
+            RespWriter.writeError(out,
+                    "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
+            return;
+        }
+        if (server.checkPassword(args[1])) {
+            auth.markAuthenticated();
+            RespWriter.writeSimpleString(out, "OK");
+        } else {
+            RespWriter.writeError(out,
+                    "WRONGPASS invalid username-password pair or user is disabled.");
         }
     }
 

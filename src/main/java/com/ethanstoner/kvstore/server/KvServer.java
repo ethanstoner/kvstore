@@ -36,6 +36,7 @@ public final class KvServer implements AutoCloseable {
 
     private final KvStore store;
     private final int requestedPort;
+    private final String requirePassword;
 
     private final Set<ClientConnection> activeConnections =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
@@ -50,8 +51,26 @@ public final class KvServer implements AutoCloseable {
     private volatile boolean running;
 
     public KvServer(KvStore store, int port) {
+        this(store, port, null);
+    }
+
+    public KvServer(KvStore store, int port, String requirePassword) {
         this.store = store;
         this.requestedPort = port;
+        this.requirePassword = requirePassword;
+    }
+
+    public boolean isAuthRequired() { return requirePassword != null; }
+
+    /**
+     * Constant-time password check. Returns false if no password is configured
+     * (callers should check isAuthRequired() first if they need to distinguish).
+     */
+    public boolean checkPassword(String attempt) {
+        if (requirePassword == null || attempt == null) return false;
+        byte[] expected = requirePassword.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] actual   = attempt.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        return java.security.MessageDigest.isEqual(expected, actual);
     }
 
     public synchronized void start() throws IOException {
