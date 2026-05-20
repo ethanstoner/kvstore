@@ -223,6 +223,7 @@ public final class KvServer implements AutoCloseable {
             try { totalBytes += sst.fileSize(); } catch (IOException ignored) {}
         }
         s.append("sstable_total_bytes:").append(totalBytes).append('\n');
+        s.append("last_snapshot_epoch_sec:").append(store.lastSnapshotEpochSec()).append('\n');
         s.append("dbsize_approx:").append(approximateKeyCount()).append('\n');
         s.append('\n');
         s.append("# cache\n");

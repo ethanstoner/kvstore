@@ -465,4 +465,36 @@ class CommandHandlerTest {
         String result = run("SET", "k", "v", "XX");
         assertTrue(result.startsWith("-ERR"), result);
     }
+
+    // ── Snapshot command tests ───────────────────────────────────────────────
+
+    @Test
+    void saveCommand() throws IOException {
+        run("SET", "a", "1");
+        assertEquals("+OK\r\n", run("SAVE"));
+    }
+
+    @Test
+    void bgsaveCommand() throws IOException {
+        run("SET", "a", "1");
+        String reply = run("BGSAVE");
+        assertEquals("+Background saving started\r\n", reply);
+    }
+
+    @Test
+    void lastsaveReturnsZeroBeforeAnySnapshot() throws IOException {
+        assertEquals(":0\r\n", run("LASTSAVE"));
+    }
+
+    @Test
+    void lastsaveAdvancesAfterSave() throws IOException {
+        run("SET", "k", "v");
+        run("SAVE");
+        String reply = run("LASTSAVE");
+        // Returns :<epoch>\r\n
+        assertTrue(reply.startsWith(":"), reply);
+        assertTrue(reply.endsWith("\r\n"), reply);
+        long ts = Long.parseLong(reply.substring(1, reply.indexOf("\r")));
+        assertTrue(ts > 0, "expected positive epoch, got " + ts);
+    }
 }

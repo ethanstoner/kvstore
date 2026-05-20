@@ -85,6 +85,9 @@ public final class CommandHandler {
                 case "TTL"      -> ttl(args, out, false);
                 case "PTTL"     -> ttl(args, out, true);
                 case "PERSIST"  -> persist(args, out);
+                case "SAVE"         -> save(args, out);
+                case "BGSAVE"       -> bgsave(args, out);
+                case "LASTSAVE"     -> lastsave(args, out);
                 case "COMMAND"      -> RespWriter.writeArray(out, List.of());
                 case "QUIT"         -> RespWriter.writeSimpleString(out, "OK");
                 case "SHUTDOWN"     -> shutdown(out);
@@ -367,6 +370,29 @@ public final class CommandHandler {
         RespWriter.writeBulkString(out, tag);
         RespWriter.writeBulkString(out, target);
         RespWriter.writeInteger(out, count);
+    }
+
+    // ── Snapshot commands ────────────────────────────────────────────────────
+
+    private void save(String[] args, OutputStream out) throws IOException {
+        if (args.length != 1) { wrongArity(out, "SAVE"); return; }
+        try {
+            store.snapshot();
+            RespWriter.writeSimpleString(out, "OK");
+        } catch (IOException e) {
+            RespWriter.writeError(out, "ERR snapshot failed: " + e.getMessage());
+        }
+    }
+
+    private void bgsave(String[] args, OutputStream out) throws IOException {
+        if (args.length != 1) { wrongArity(out, "BGSAVE"); return; }
+        store.bgsnapshot();
+        RespWriter.writeSimpleString(out, "Background saving started");
+    }
+
+    private void lastsave(String[] args, OutputStream out) throws IOException {
+        if (args.length != 1) { wrongArity(out, "LASTSAVE"); return; }
+        RespWriter.writeInteger(out, store.lastSnapshotEpochSec());
     }
 
     private static void wrongArity(OutputStream out, String cmd) throws IOException {

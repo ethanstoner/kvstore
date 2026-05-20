@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.Future;
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.NavigableSet;
@@ -131,6 +132,21 @@ public final class KvStore implements AutoCloseable {
 
     /** Shared LRU block cache — one instance for all SSTables. */
     private final BlockCache blockCache = new BlockCache(1024);
+
+    // ── Snapshot support ──────────────────────────────────────────────────────
+
+    private final ExecutorService snapshotExecutor =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "kvstore-snapshot");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /** Epoch seconds of the last successful SAVE / BGSAVE; 0 if never. */
+    private volatile long lastSnapshotEpochSec = 0;
+
+    /** Non-null while a background snapshot is in flight; may be done. */
+    private volatile Future<?> pendingSnapshot;
 
     // =========================================================================
     // Constructor
@@ -796,6 +812,92 @@ public final class KvStore implements AutoCloseable {
     public BlockCache blockCache() { return blockCache; }
 
     // =========================================================================
+    // Snapshot — SAVE / BGSAVE / LASTSAVE
+    // =========================================================================
+
+    /**
+     * Synchronously writes all current data to a single sorted snapshot file
+     * at {@code dataDir/snapshot-<epochMs>.db}. Returns the path written.
+     */
+    public Path snapshot() throws IOException {
+        long ts = System.currentTimeMillis();
+        Path target = dataDir.resolve(String.format("snapshot-%013d.db", ts));
+        writeSnapshotTo(target);
+        lastSnapshotEpochSec = ts / 1000;
+        return target;
+    }
+
+    /**
+     * Triggers a background snapshot. Returns immediately. Subsequent calls
+     * while a snapshot is in flight return a Future for the existing one.
+     */
+    public Future<?> bgsnapshot() {
+        Future<?> existing = pendingSnapshot;
+        if (existing != null && !existing.isDone()) return existing;
+        pendingSnapshot = snapshotExecutor.submit(() -> {
+            try { snapshot(); } catch (IOException e) {
+                System.err.println("BGSAVE failed: " + e);
+            }
+        });
+        return pendingSnapshot;
+    }
+
+    /** @return epoch seconds of last successful snapshot, or 0 if never. */
+    public long lastSnapshotEpochSec() { return lastSnapshotEpochSec; }
+
+    /**
+     * Merges all data layers (active memtable, immutable memtable, SSTables)
+     * into a single sorted, tombstone-free, non-expired snapshot file.
+     */
+    private void writeSnapshotTo(Path target) throws IOException {
+        TreeMap<String, ValueEntry> merged = new TreeMap<>();
+        long now = System.currentTimeMillis();
+
+        // Capture snapshots of state under flushLock to get a consistent view.
+        Memtable activeSnap;
+        Memtable immutableSnap;
+        List<SSTable> ssts;
+        flushLock.lock();
+        try {
+            activeSnap    = memtable;
+            immutableSnap = immutableMemtable;
+            ssts          = sstables;
+        } finally {
+            flushLock.unlock();
+        }
+
+        // 1. Active memtable (newest — wins over everything).
+        for (Map.Entry<String, ValueEntry> e : activeSnap.entries().entrySet()) {
+            merged.put(e.getKey(), e.getValue());
+        }
+        // 2. Immutable memtable (older than active, newer than SSTables).
+        if (immutableSnap != null) {
+            for (Map.Entry<String, ValueEntry> e : immutableSnap.entries().entrySet()) {
+                merged.putIfAbsent(e.getKey(), e.getValue());
+            }
+        }
+        // 3. SSTables newest-to-oldest; putIfAbsent so newer sources win.
+        List<SSTable> sortedByAge = new ArrayList<>(ssts);
+        sortedByAge.sort(Comparator.comparingInt(SSTable::sequenceNum).reversed());
+        for (SSTable s : sortedByAge) {
+            NavigableSet<String> keys = s.keySet();
+            if (keys.isEmpty()) continue;
+            NavigableMap<String, ValueEntry> all = s.scan(keys.first(), keys.last() + "\0");
+            for (Map.Entry<String, ValueEntry> e : all.entrySet()) {
+                merged.putIfAbsent(e.getKey(), e.getValue());
+            }
+        }
+
+        // Filter: drop tombstones and expired entries.
+        merged.entrySet().removeIf(e ->
+                Memtable.TOMBSTONE.equals(e.getValue().value())
+                || e.getValue().isExpired(now));
+
+        // Write using the SSTable format (self-contained sorted file).
+        SSTable.write(target, merged.entrySet());
+    }
+
+    // =========================================================================
     // AutoCloseable
     // =========================================================================
 
@@ -806,6 +908,16 @@ public final class KvStore implements AutoCloseable {
     public void close() throws IOException {
         if (compactionThread != null) {
             compactionThread.interrupt();
+        }
+
+        // Drain the snapshot executor BEFORE acquiring flushLock.
+        // The snapshot background task acquires flushLock internally, so
+        // awaiting termination while holding the lock would deadlock.
+        snapshotExecutor.shutdown();
+        try {
+            snapshotExecutor.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
         }
 
         flushLock.lock();
