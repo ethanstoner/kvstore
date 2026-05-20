@@ -42,4 +42,20 @@ class BloomFilterTest {
         bf.add("only");
         assertTrue(bf.mightContain("only"));
     }
+
+    @Test
+    void serializationRoundTrip() throws Exception {
+        BloomFilter original = new BloomFilter(200, 0.01);
+        for (int i = 0; i < 200; i++) original.add("ser-" + i);
+
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        original.writeTo(new java.io.DataOutputStream(baos));
+
+        java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(baos.toByteArray());
+        BloomFilter restored = BloomFilter.readFrom(new java.io.DataInputStream(bais));
+
+        for (int i = 0; i < 200; i++) {
+            assertTrue(restored.mightContain("ser-" + i), "Lost key ser-" + i);
+        }
+    }
 }
