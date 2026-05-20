@@ -126,6 +126,8 @@ Every write is logged to disk **before** it is applied in memory — that orderi
 - **Concurrent flush** — non-blocking memtable flush; writes don't stall on disk I/O. Crash-safe via dual-WAL
 - **Leveled compaction** — LevelDB/RocksDB-style: L0 (overlapping) + L1+ (non-overlapping, 10× growth). Bounded read amplification, lower space amp
 - **Atomic DEL** — check-and-delete under the write lock; concurrent clients see accurate counts
+- **Atomic numeric ops** — `INCR`, `DECR`, `INCRBY`, `DECRBY` with overflow detection
+- **TTL / expiration** — `SET key val EX 60`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`. Expired entries are invisible to reads and dropped during compaction
 - **Range scans** — ordered `[from, to)` scans merged across all levels
 - **Crash recovery** — replays WAL on startup (stops at first corrupt record), skips corrupt SSTable files
 - **JMH benchmarks** — measure write/read/scan throughput
@@ -207,7 +209,7 @@ redis-cli -p 6379 get hello                           # (error) NOAUTH Authentic
 redis-cli -p 6379 --tls --cacert ca.crt ping          # encrypted handshake
 ```
 
-Supported commands: `AUTH`, `PING`, `SET`, `GET`, `DEL`, `EXISTS`, `MGET`, `MSET`, `SCAN from to` (range scan, not cursor), `DBSIZE`, `INFO`, `COMMAND`, `QUIT`, `SHUTDOWN`.
+Supported commands: `AUTH`, `PING`, `SET` (with `EX`/`PX`), `GET`, `DEL`, `EXISTS`, `MGET`, `MSET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `SCAN from to` (range scan, not cursor), `DBSIZE`, `INFO`, `COMMAND`, `QUIT`, `SHUTDOWN`.
 
 ### As an embedded one-shot CLI
 
