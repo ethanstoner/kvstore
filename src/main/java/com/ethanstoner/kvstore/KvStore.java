@@ -366,6 +366,20 @@ public final class KvStore implements AutoCloseable {
     }
 
     // =========================================================================
+    // Server accessors
+    // =========================================================================
+
+    /** @return snapshot of currently-loaded SSTables (newest last). */
+    public java.util.List<SSTable> sstableSnapshot() {
+        return sstables;   // already an unmodifiable list
+    }
+
+    /** @return current memtable size in approximate bytes. */
+    public long memtableApproximateBytes() {
+        return memtable.approximateBytes();
+    }
+
+    // =========================================================================
     // AutoCloseable
     // =========================================================================
 
