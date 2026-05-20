@@ -6,8 +6,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -52,6 +55,9 @@ public final class KvStore implements AutoCloseable {
 
     /** Serialises flush operations (writes and flushes may interleave reads). */
     private final ReentrantLock flushLock = new ReentrantLock();
+
+    /** Background compaction thread. */
+    private Thread compactionThread;
 
     // =========================================================================
     // Constructor
@@ -101,6 +107,8 @@ public final class KvStore implements AutoCloseable {
                 memtable.put(key, value);
             }
         });
+
+        startCompactionThread();
     }
 
     // =========================================================================
@@ -232,11 +240,116 @@ public final class KvStore implements AutoCloseable {
     }
 
     // =========================================================================
+    // Compaction
+    // =========================================================================
+
+    private void startCompactionThread() {
+        compactionThread = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(5000);
+                    runCompaction();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (IOException e) {
+                    // Log and continue
+                }
+            }
+        }, "kvstore-compaction");
+        compactionThread.setDaemon(true);
+        compactionThread.start();
+    }
+
+    /**
+     * Triggers compaction immediately (used in tests and for manual compaction).
+     */
+    public void compactNow() throws IOException {
+        runCompaction();
+    }
+
+    private void runCompaction() throws IOException {
+        List<SSTable> snapshot = sstables;
+        if (snapshot.size() < 4) return;
+
+        // Group by size tier (order of magnitude)
+        Map<Integer, List<SSTable>> tiers = new HashMap<>();
+        for (SSTable sst : snapshot) {
+            int tier = (int) Math.floor(Math.log10(Math.max(1, sst.fileSize())));
+            tiers.computeIfAbsent(tier, k -> new ArrayList<>()).add(sst);
+        }
+
+        // Find a tier with 4+ SSTables, or compact all
+        List<SSTable> toCompact = null;
+        for (List<SSTable> group : tiers.values()) {
+            if (group.size() >= 4) {
+                toCompact = group;
+                break;
+            }
+        }
+        if (toCompact == null) {
+            toCompact = new ArrayList<>(snapshot);
+        }
+
+        // Is this a full compaction?
+        boolean fullCompaction = toCompact.size() == snapshot.size();
+
+        // K-way merge: newest-first so putIfAbsent keeps newest value
+        TreeMap<String, String> merged = new TreeMap<>();
+        List<SSTable> sorted = new ArrayList<>(toCompact);
+        sorted.sort(Comparator.comparingInt(SSTable::sequenceNum).reversed());
+
+        for (SSTable sst : sorted) {
+            if (sst.keySet().isEmpty()) continue;
+            NavigableMap<String, String> all = sst.scan(
+                    sst.keySet().first(), sst.keySet().last() + "\0");
+            for (Map.Entry<String, String> e : all.entrySet()) {
+                merged.putIfAbsent(e.getKey(), e.getValue());
+            }
+        }
+
+        // Drop tombstones only in full compaction
+        if (fullCompaction) {
+            merged.values().removeIf(v -> Memtable.TOMBSTONE.equals(v));
+        }
+
+        flushLock.lock();
+        try {
+            if (merged.isEmpty()) {
+                List<SSTable> newList = new ArrayList<>(sstables);
+                for (SSTable old : toCompact) {
+                    newList.remove(old);
+                    old.close();
+                    Files.deleteIfExists(old.path());
+                }
+                sstables = Collections.unmodifiableList(newList);
+                return;
+            }
+
+            Path mergedPath = SSTable.fileName(dataDir, nextSequence++);
+            SSTable.write(mergedPath, merged.entrySet());
+            SSTable mergedSst = SSTable.open(mergedPath);
+
+            List<SSTable> newList = new ArrayList<>(sstables);
+            for (SSTable old : toCompact) {
+                newList.remove(old);
+                old.close();
+                Files.deleteIfExists(old.path());
+            }
+            newList.add(mergedSst);
+            newList.sort(Comparator.comparingInt(SSTable::sequenceNum));
+            sstables = Collections.unmodifiableList(newList);
+        } finally {
+            flushLock.unlock();
+        }
+    }
+
+    // =========================================================================
     // AutoCloseable
     // =========================================================================
 
     @Override
     public void close() throws IOException {
+        if (compactionThread != null) compactionThread.interrupt();
         flushLock.lock();
         try {
             wal.close();

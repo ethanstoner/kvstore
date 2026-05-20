@@ -153,4 +153,48 @@ class KvStoreTest {
             assertEquals("new-value", scan.get("key"));
         }
     }
+
+    @Test
+    void compactionMergesSSTables(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            String bigValue = "x".repeat(100);
+            for (int i = 0; i < 80_000; i++) {
+                store.put("key-" + String.format("%06d", i), bigValue);
+            }
+            long beforeCount = java.nio.file.Files.list(dir)
+                    .filter(p -> p.getFileName().toString().endsWith(".db"))
+                    .count();
+            assertTrue(beforeCount >= 4, "Expected >=4 SSTables, got " + beforeCount);
+
+            store.compactNow();
+
+            long afterCount = java.nio.file.Files.list(dir)
+                    .filter(p -> p.getFileName().toString().endsWith(".db"))
+                    .count();
+            assertTrue(afterCount < beforeCount,
+                    "Expected fewer SSTables after compaction: before=" + beforeCount + " after=" + afterCount);
+
+            assertEquals(Optional.of(bigValue), store.get("key-000000"));
+            assertEquals(Optional.of(bigValue), store.get("key-079999"));
+        }
+    }
+
+    @Test
+    void compactionDropsTombstones(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            store.put("doomed", "value");
+            String bigValue = "x".repeat(100);
+            for (int i = 0; i < 20_000; i++) {
+                store.put("pad1-" + String.format("%06d", i), bigValue);
+            }
+            store.delete("doomed");
+            for (int i = 0; i < 20_000; i++) {
+                store.put("pad2-" + String.format("%06d", i), bigValue);
+            }
+
+            store.compactNow();
+
+            assertTrue(store.get("doomed").isEmpty());
+        }
+    }
 }
