@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -13,6 +14,10 @@ import java.util.Map;
 import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -24,11 +29,28 @@ import java.util.concurrent.locks.ReentrantLock;
  *                                              │
  *                                    [flush when too big]
  *                                              ▼
- *                                          SSTable (immutable, on disk)
- *   get(k)   ─► Memtable.get  ─► newest SSTable ─► older SSTables
+ *                                    immutableMemtable ─► SSTable (background)
+ *   get(k)   ─► active memtable  ─► immutable memtable  ─► SSTables (newest→oldest)
  * </pre>
  *
- * <p>On construction it {@link WriteAheadLog#replay replays} the WAL so the
+ * <h2>Concurrent flush</h2>
+ * <p>When a flush is triggered the active memtable moves to an
+ * {@link #immutableMemtable} slot and is written to an SSTable on a single
+ * background thread ({@link #flushExecutor}).  Writers return immediately after
+ * the swap (the I/O happens off the write path).  Reads always check all three
+ * layers in recency order without holding any lock.
+ *
+ * <h2>Two-WAL crash safety (LevelDB-style)</h2>
+ * <ul>
+ *   <li>{@code wal.log} — active WAL for the current memtable.</li>
+ *   <li>{@code wal-pending.log} — exists only while a flush is in progress;
+ *       holds the WAL of the immutable memtable being written to disk.</li>
+ * </ul>
+ * <p>On startup both WALs are replayed (pending first, active second) before
+ * normal operation resumes. {@code wal-pending.log} is deleted by the
+ * background thread after the corresponding SSTable is successfully synced.
+ *
+ * <p>On construction it {@link WriteAheadLog#replay replays} the WAL(s) so the
  * store comes back exactly as it was before the last shutdown or crash.
  */
 public final class KvStore implements AutoCloseable {
@@ -36,13 +58,26 @@ public final class KvStore implements AutoCloseable {
     /** Flush the memtable to disk once it exceeds this many bytes. */
     static final long FLUSH_THRESHOLD_BYTES = 4L * 1024 * 1024; // 4 MB
 
+    private static final String WAL_NAME         = "wal.log";
+    private static final String WAL_PENDING_NAME = "wal-pending.log";
+
     private final Path dataDir;
 
     /** Sequence counter for the next SSTable file. Guarded by {@link #flushLock}. */
     private int nextSequence;
 
-    /** In-memory write buffer. Replaced atomically on flush. */
+    /**
+     * Active in-memory write buffer. Volatile so reads observe the latest
+     * reference without holding {@link #flushLock}.
+     */
     private volatile Memtable memtable;
+
+    /**
+     * Non-null only while a background flush is in progress.  Readers check
+     * this <em>after</em> the active memtable and <em>before</em> SSTables.
+     * Written and cleared under {@link #flushLock}; read without any lock.
+     */
+    private volatile Memtable immutableMemtable;
 
     /**
      * Ordered list of on-disk SSTables, oldest first.
@@ -50,11 +85,31 @@ public final class KvStore implements AutoCloseable {
      */
     private volatile List<SSTable> sstables;
 
-    /** Current WAL. Replaced atomically on flush. */
+    /**
+     * Current active WAL — corresponds to {@link #memtable}.
+     * Guarded by {@link #flushLock} for structural changes (swap / rotate).
+     */
     private WriteAheadLog wal;
 
-    /** Serialises flush operations (writes and flushes may interleave reads). */
+    /** Serialises writes and structural mutations (flush trigger, compaction). */
     private final ReentrantLock flushLock = new ReentrantLock();
+
+    /**
+     * Signalled (under {@link #flushLock}) when a background flush finishes
+     * and {@link #immutableMemtable} is cleared back to {@code null}.
+     */
+    private final Condition pendingFlushDone = flushLock.newCondition();
+
+    /**
+     * Single background thread for flushing.  One thread means at most one
+     * immutable memtable exists at a time; the {@link #immutableMemtable} field
+     * is effectively a one-slot queue.
+     */
+    private final ExecutorService flushExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "kvstore-flush");
+        t.setDaemon(true);
+        return t;
+    });
 
     /** Background compaction thread. */
     private Thread compactionThread;
@@ -72,7 +127,8 @@ public final class KvStore implements AutoCloseable {
      * <ul>
      *   <li>Scans {@code dataDir} for existing {@code sst-*.db} files and opens
      *       them (corrupt files are silently skipped).</li>
-     *   <li>Replays the WAL to rebuild any writes that were not yet flushed.</li>
+     *   <li>Replays {@code wal-pending.log} first (if it exists), then
+     *       {@code wal.log}, to rebuild any writes that were not yet flushed.</li>
      * </ul>
      */
     public KvStore(Path dataDir) throws IOException {
@@ -94,7 +150,7 @@ public final class KvStore implements AutoCloseable {
             }
         }
         // Sort oldest → newest by sequence number.
-        loaded.sort((a, b) -> Integer.compare(a.sequenceNum(), b.sequenceNum()));
+        loaded.sort(Comparator.comparingInt(SSTable::sequenceNum));
         this.sstables = Collections.unmodifiableList(loaded);
 
         // Determine next sequence number.
@@ -102,15 +158,31 @@ public final class KvStore implements AutoCloseable {
                 : loaded.get(loaded.size() - 1).sequenceNum();
         this.nextSequence = maxSeq + 1;
 
-        // --- 2. Start fresh memtable and replay WAL -----------------------------
+        // --- 2. Build fresh memtable from WAL replay ----------------------------
         this.memtable = new Memtable();
-        this.wal = new WriteAheadLog(dataDir.resolve("wal.log"));
-        wal.replay((key, value) -> {
-            if (value == null) {
-                memtable.delete(key);
-            } else {
-                memtable.put(key, value);
+        this.immutableMemtable = null;
+
+        // Replay wal-pending.log first (older data — was being flushed at crash).
+        // We leave it on disk; it will be deleted when the next flush completes
+        // and clobbers it via REPLACE_EXISTING (see triggerFlush) then the
+        // background task deletes it.  This is safe: if we crash again before
+        // any flush, both WALs are replayed again on the next restart.
+        Path pendingWalPath = dataDir.resolve(WAL_PENDING_NAME);
+        if (Files.exists(pendingWalPath)) {
+            try (WriteAheadLog pendingWal = new WriteAheadLog(pendingWalPath)) {
+                pendingWal.replay((key, value) -> {
+                    if (value == null) memtable.delete(key);
+                    else              memtable.put(key, value);
+                });
             }
+        }
+
+        // Replay active WAL (newer data — normal writes since last flush).
+        Path walPath = dataDir.resolve(WAL_NAME);
+        this.wal = new WriteAheadLog(walPath);
+        wal.replay((key, value) -> {
+            if (value == null) memtable.delete(key);
+            else               memtable.put(key, value);
         });
 
         startCompactionThread();
@@ -123,9 +195,12 @@ public final class KvStore implements AutoCloseable {
     public void put(String key, String value) throws IOException {
         flushLock.lock();
         try {
+            // Block if the single immutable slot is occupied.
+            waitForFlushSlot();
+
             wal.appendPut(key, value);   // durable first
             memtable.put(key, value);    // then visible
-            maybeFlush();
+            triggerFlushIfNeeded();
         } finally {
             flushLock.unlock();
         }
@@ -134,9 +209,11 @@ public final class KvStore implements AutoCloseable {
     public void delete(String key) throws IOException {
         flushLock.lock();
         try {
+            waitForFlushSlot();
+
             wal.appendDelete(key);
             memtable.delete(key);
-            maybeFlush();
+            triggerFlushIfNeeded();
         } finally {
             flushLock.unlock();
         }
@@ -154,9 +231,10 @@ public final class KvStore implements AutoCloseable {
         try {
             boolean exists = get(key).isPresent();
             if (exists) {
+                waitForFlushSlot();
                 wal.appendDelete(key);
                 memtable.delete(key);
-                maybeFlush();
+                triggerFlushIfNeeded();
             }
             return exists;
         } finally {
@@ -169,19 +247,34 @@ public final class KvStore implements AutoCloseable {
     // =========================================================================
 
     /**
-     * Point lookup. Checks the memtable first, then SSTables newest-to-oldest.
+     * Point lookup. Checks the memtable first, then the immutable memtable (if
+     * a flush is in progress), then SSTables newest-to-oldest.
+     *
+     * <p>Intentionally lock-free: takes a snapshot of each volatile field once.
      *
      * @return the value, or {@code Optional.empty()} if absent / deleted
      */
     public Optional<String> get(String key) throws IOException {
-        // 1. Check memtable (most recent data).
-        String v = memtable.get(key);
+        // Snapshot all volatile references once; no lock needed.
+        Memtable active    = memtable;
+        Memtable immutable = immutableMemtable;
+        List<SSTable> tables = sstables;
+
+        // 1. Active memtable (most recent writes).
+        String v = active.get(key);
         if (v != null) {
             return Memtable.TOMBSTONE.equals(v) ? Optional.empty() : Optional.of(v);
         }
 
-        // 2. Walk SSTables newest-to-oldest.
-        List<SSTable> tables = sstables;
+        // 2. Immutable memtable (in RAM, slightly older — being flushed right now).
+        if (immutable != null) {
+            v = immutable.get(key);
+            if (v != null) {
+                return Memtable.TOMBSTONE.equals(v) ? Optional.empty() : Optional.of(v);
+            }
+        }
+
+        // 3. SSTables newest-to-oldest.
         for (int i = tables.size() - 1; i >= 0; i--) {
             Optional<String> found = tables.get(i).get(key);
             if (found.isPresent()) {
@@ -196,24 +289,35 @@ public final class KvStore implements AutoCloseable {
     /**
      * Ordered range scan, {@code [fromInclusive, toExclusive)}, tombstones hidden.
      *
-     * <p>Uses a "first write wins" merge: the memtable (newest) populates the
-     * result map first, then SSTables newest-to-oldest fill in any gaps.
-     * Tombstones are filtered out at the end.
+     * <p>Merges active memtable, immutable memtable (if any), and all SSTables
+     * newest-to-oldest; the first writer wins (newest data takes precedence).
      */
     public Map<String, String> scan(String fromInclusive, String toExclusive)
             throws IOException {
 
+        // Snapshot all volatile references once; no lock needed.
+        Memtable active    = memtable;
+        Memtable immutable = immutableMemtable;
+        List<SSTable> tables = sstables;
+
         // Use TreeMap so result is sorted.
         TreeMap<String, String> merged = new TreeMap<>();
 
-        // 1. Memtable entries (newest, populate first).
+        // 1. Active memtable entries (newest — populate first).
         for (Map.Entry<String, String> e :
-                memtable.scan(fromInclusive, toExclusive).entrySet()) {
+                active.scan(fromInclusive, toExclusive).entrySet()) {
             merged.put(e.getKey(), e.getValue());
         }
 
-        // 2. SSTables newest-to-oldest; putIfAbsent keeps the newest value.
-        List<SSTable> tables = sstables;
+        // 2. Immutable memtable (if a flush is in progress — older than active).
+        if (immutable != null) {
+            for (Map.Entry<String, String> e :
+                    immutable.scan(fromInclusive, toExclusive).entrySet()) {
+                merged.putIfAbsent(e.getKey(), e.getValue());
+            }
+        }
+
+        // 3. SSTables newest-to-oldest; putIfAbsent keeps the newest value.
         for (int i = tables.size() - 1; i >= 0; i--) {
             for (Map.Entry<String, String> e :
                     tables.get(i).scan(fromInclusive, toExclusive).entrySet()) {
@@ -221,50 +325,109 @@ public final class KvStore implements AutoCloseable {
             }
         }
 
-        // 3. Filter out tombstones.
+        // 4. Filter out tombstones.
         merged.entrySet().removeIf(e -> Memtable.TOMBSTONE.equals(e.getValue()));
 
         return merged;
     }
 
     // =========================================================================
-    // Flush
+    // Flush — trigger (fast, under lock) + background task (slow, no lock)
     // =========================================================================
 
     /**
-     * Flushes the memtable to a new SSTable if the size threshold is exceeded.
+     * Waits until the immutable-memtable slot is free.
      *
      * <p>Must be called while holding {@link #flushLock}.
      */
-    private void maybeFlush() throws IOException {
+    private void waitForFlushSlot() throws IOException {
+        while (immutableMemtable != null) {
+            try {
+                pendingFlushDone.await();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted waiting for flush slot", ie);
+            }
+        }
+    }
+
+    /**
+     * If the active memtable has grown past the flush threshold, snapshots it
+     * into the immutable slot, rotates the WAL, and submits a background flush.
+     *
+     * <p>Must be called while holding {@link #flushLock}.
+     * Callers must have already ensured {@link #immutableMemtable} is {@code null}
+     * (i.e. called {@link #waitForFlushSlot} first).
+     */
+    private void triggerFlushIfNeeded() throws IOException {
         if (memtable.approximateBytes() < FLUSH_THRESHOLD_BYTES) {
             return;
         }
 
-        // Capture the memtable we are flushing.
-        Memtable flushing = this.memtable;
+        // Move active memtable to immutable slot.
+        Memtable snapshot = memtable;
+        immutableMemtable = snapshot;
 
-        // Write a new SSTable.
-        Path sstPath = SSTable.fileName(dataDir, nextSequence);
-        SSTable.write(sstPath, flushing.entries());
-        SSTable newSst = SSTable.open(sstPath);
-        newSst.attachCache(blockCache);
+        // Rotate WAL:
+        //   close the current wal.log,
+        //   rename it to wal-pending.log (overwriting any previous one — safe,
+        //   because the previous pending data already lives in the memtable we
+        //   just snapshotted above, which will end up in the new SSTable),
+        //   open a fresh wal.log for new writes.
+        wal.close();
+        Files.move(
+                dataDir.resolve(WAL_NAME),
+                dataDir.resolve(WAL_PENDING_NAME),
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE);
+        wal = new WriteAheadLog(dataDir.resolve(WAL_NAME), true);
 
-        // Atomically extend the sstables list.
-        List<SSTable> current = new ArrayList<>(sstables);
-        current.add(newSst);
-        this.sstables = Collections.unmodifiableList(current);
+        // Open fresh memtable for incoming writes.
+        memtable = new Memtable();
 
-        // Advance sequence counter.
-        nextSequence++;
+        // Capture sequence number for this flush; increment so the next flush
+        // (or compaction) gets a different number.
+        final int flushSeq = nextSequence++;
 
-        // Swap in a fresh memtable.
-        this.memtable = new Memtable();
+        // Submit the I/O work to the background thread (does not hold flushLock).
+        flushExecutor.submit(() -> doBackgroundFlush(snapshot, flushSeq));
+    }
 
-        // Truncate (reset) the WAL — the flushed data is now safely on disk.
-        WriteAheadLog oldWal = this.wal;
-        this.wal = new WriteAheadLog(dataDir.resolve("wal.log"), true);
-        oldWal.close();
+    /**
+     * Runs on the background flush thread.  Writes the immutable memtable to a
+     * new SSTable, then — under {@link #flushLock} — installs it and clears the
+     * immutable slot.
+     */
+    private void doBackgroundFlush(Memtable immutable, int seq) {
+        try {
+            Path sstPath = SSTable.fileName(dataDir, seq);
+            SSTable.write(sstPath, immutable.entries());
+            SSTable newSst = SSTable.open(sstPath);
+            newSst.attachCache(blockCache);
+
+            flushLock.lock();
+            try {
+                List<SSTable> updated = new ArrayList<>(sstables);
+                updated.add(newSst);
+                // Keep oldest-first order (seq is always ≥ all existing seqs).
+                sstables = Collections.unmodifiableList(updated);
+
+                // The pending WAL's data is now durable in the SSTable.
+                Files.deleteIfExists(dataDir.resolve(WAL_PENDING_NAME));
+
+                // Clear the immutable slot and wake any blocked writers.
+                immutableMemtable = null;
+                pendingFlushDone.signalAll();
+            } finally {
+                flushLock.unlock();
+            }
+
+        } catch (IOException e) {
+            // Log the failure but do NOT clear immutableMemtable.
+            // Writers will block in waitForFlushSlot, which is intentional —
+            // we must not acknowledge writes we cannot make durable.
+            System.err.println("[kvstore-flush] background flush failed (seq=" + seq + "): " + e);
+        }
     }
 
     // =========================================================================
@@ -290,6 +453,10 @@ public final class KvStore implements AutoCloseable {
 
     /**
      * Triggers compaction immediately (used in tests and for manual compaction).
+     *
+     * <p>Does NOT wait for any in-progress background flush to complete.  If you
+     * need to ensure all flushes are done before compacting, close and reopen
+     * the store, or wait for {@link #close()} to drain pending work.
      */
     public void compactNow() throws IOException {
         runCompaction();
@@ -381,7 +548,7 @@ public final class KvStore implements AutoCloseable {
         return sstables;   // already an unmodifiable list
     }
 
-    /** @return current memtable size in approximate bytes. */
+    /** @return current active memtable size in approximate bytes. */
     public long memtableApproximateBytes() {
         return memtable.approximateBytes();
     }
@@ -393,12 +560,46 @@ public final class KvStore implements AutoCloseable {
     // AutoCloseable
     // =========================================================================
 
+    /**
+     * Closes the store cleanly.
+     *
+     * <ol>
+     *   <li>Stops the compaction thread.</li>
+     *   <li>Waits for any in-progress background flush to finish
+     *       (so no data is lost from the immutable memtable).</li>
+     *   <li>Shuts down the flush executor.</li>
+     *   <li>Closes the WAL and all SSTables.</li>
+     * </ol>
+     */
     @Override
     public void close() throws IOException {
-        if (compactionThread != null) compactionThread.interrupt();
+        // Stop the compaction thread first (it may be holding or wanting flushLock).
+        if (compactionThread != null) {
+            compactionThread.interrupt();
+        }
+
         flushLock.lock();
         try {
+            // Drain any in-progress background flush.
+            while (immutableMemtable != null) {
+                try {
+                    pendingFlushDone.await();
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+
+            // Shut down the executor (background task has finished or we broke out).
+            flushExecutor.shutdown();
+            try {
+                flushExecutor.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+
             wal.close();
+
             IOException first = null;
             for (SSTable sst : sstables) {
                 try {
