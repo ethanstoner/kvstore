@@ -42,8 +42,12 @@ public final class SSTable implements AutoCloseable {
 
     private static final int  MAGIC        = 0x4B565354; // "KVST"
     private static final int  FOOTER_BYTES = 24;
-    private static final byte OP_TOMBSTONE = 0;
-    private static final byte OP_VALUE     = 1;
+    private static final byte OP_TOMBSTONE      = 0;
+    private static final byte OP_VALUE          = 1;
+    private static final byte OP_VALUE_DEFLATE  = 2;
+
+    /** Values whose UTF-8 byte length exceeds this threshold are compressed. */
+    private static final int COMPRESS_THRESHOLD_BYTES = 64;
 
     private static final Pattern FILENAME_PATTERN =
             Pattern.compile("sst-(\\d+)\\.db");
@@ -135,20 +139,35 @@ public final class SSTable implements AutoCloseable {
                 byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
                 boolean isTombstone = Memtable.TOMBSTONE.equals(value);
 
-                // op (1 byte)
-                out.writeByte(isTombstone ? OP_TOMBSTONE : OP_VALUE);
-                pos += 1;
-
-                // keyLen (2 bytes) + key bytes
-                out.writeShort(keyBytes.length);
-                out.write(keyBytes);
-                pos += 2 + keyBytes.length;
-
-                if (!isTombstone) {
+                if (isTombstone) {
+                    out.writeByte(OP_TOMBSTONE);
+                    out.writeShort(keyBytes.length);
+                    out.write(keyBytes);
+                    pos += 1 + 2 + keyBytes.length;
+                } else {
                     byte[] valBytes = value.getBytes(StandardCharsets.UTF_8);
-                    out.writeInt(valBytes.length);
-                    out.write(valBytes);
-                    pos += 4 + valBytes.length;
+                    byte[] payload;
+                    byte op;
+                    if (valBytes.length > COMPRESS_THRESHOLD_BYTES) {
+                        byte[] compressed = deflate(valBytes);
+                        if (compressed.length < valBytes.length) {
+                            op      = OP_VALUE_DEFLATE;
+                            payload = compressed;
+                        } else {
+                            // Compression didn't help (e.g. already-random data). Store raw.
+                            op      = OP_VALUE;
+                            payload = valBytes;
+                        }
+                    } else {
+                        op      = OP_VALUE;
+                        payload = valBytes;
+                    }
+                    out.writeByte(op);
+                    out.writeShort(keyBytes.length);
+                    out.write(keyBytes);
+                    out.writeInt(payload.length);
+                    out.write(payload);
+                    pos += 1 + 2 + keyBytes.length + 4 + payload.length;
                 }
             }
 
@@ -390,6 +409,50 @@ public final class SSTable implements AutoCloseable {
     // Private helpers
     // =========================================================================
 
+    /** Compresses {@code data} with Deflate and returns the compressed bytes. */
+    private static byte[] deflate(byte[] data) {
+        java.util.zip.Deflater deflater =
+                new java.util.zip.Deflater(java.util.zip.Deflater.DEFAULT_COMPRESSION);
+        try {
+            deflater.setInput(data);
+            deflater.finish();
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(data.length);
+            byte[] buf = new byte[1024];
+            while (!deflater.finished()) {
+                int n = deflater.deflate(buf);
+                baos.write(buf, 0, n);
+            }
+            return baos.toByteArray();
+        } finally {
+            deflater.end();
+        }
+    }
+
+    /** Decompresses Deflate-compressed {@code compressed} and returns the original bytes. */
+    private static byte[] inflate(byte[] compressed) throws IOException {
+        java.util.zip.Inflater inflater = new java.util.zip.Inflater();
+        try {
+            inflater.setInput(compressed);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(compressed.length * 2);
+            byte[] buf = new byte[1024];
+            while (!inflater.finished()) {
+                int n;
+                try {
+                    n = inflater.inflate(buf);
+                } catch (java.util.zip.DataFormatException e) {
+                    throw new IOException("inflate failed", e);
+                }
+                if (n == 0) {
+                    if (inflater.needsInput() || inflater.needsDictionary()) break;
+                }
+                baos.write(buf, 0, n);
+            }
+            return baos.toByteArray();
+        } finally {
+            inflater.end();
+        }
+    }
+
     /**
      * Reads the value (or tombstone sentinel) stored at the given absolute
      * file offset. Checks the {@link BlockCache} before seeking; populates
@@ -412,7 +475,14 @@ public final class SSTable implements AutoCloseable {
                 int vLen = raf.readInt();
                 byte[] vBytes = new byte[vLen];
                 raf.readFully(vBytes);
-                value = new String(vBytes, StandardCharsets.UTF_8);
+                if (op == OP_VALUE_DEFLATE) {
+                    byte[] decompressed = inflate(vBytes);
+                    value = new String(decompressed, StandardCharsets.UTF_8);
+                } else if (op == OP_VALUE) {
+                    value = new String(vBytes, StandardCharsets.UTF_8);
+                } else {
+                    throw new IOException("unknown op byte: " + op);
+                }
             }
         }
         if (cache != null) {
