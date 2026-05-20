@@ -8,3 +8,14 @@ kvdata/
 docs/plans/
 docs/specs/
 dependency-reduced-pom.xml
+bench-results.json
+bench-results.txt
+verify-data/
+verify-srv.log
+verify-srv.err.log
+smoke-server.log
+smoke-server.err.log
+crash-srv.log
+crash-srv.err.log
+crash-srv2.log
+crash-srv2.err.log

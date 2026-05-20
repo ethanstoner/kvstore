@@ -1,32 +1,106 @@
 # kvstore
 
-A persistent key-value store with an **LSM-tree storage engine** and a **Redis-compatible network server**, written from scratch in Java 21 — no database libraries. The same storage architecture used by LevelDB, RocksDB, and the storage layer of Cassandra, fronted by a TCP server speaking the RESP protocol so any Redis client can connect.
+> **A persistent, Redis-compatible key-value database. Built from scratch in Java 21 — no database libraries.**
 
-[![CI](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml)
+The same LSM-tree storage engine that powers LevelDB and RocksDB, fronted by a TCP server speaking the Redis RESP protocol. Any Redis client (`redis-cli`, `redis-py`, `Jedis`, etc.) connects out of the box.
+
+[![CI](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml) &nbsp; **203 tests** · **5,200 LOC** · **JDK 21** · **MIT License**
 
 ```bash
-# Start the server
 $ java -jar kvstore.jar serve --port 6379
+kvstore server listening on 6379
 
-# Connect with any Redis client
 $ redis-cli -p 6379 set user:42 Ethan
 OK
-$ redis-cli -p 6379 get user:42
-"Ethan"
+$ redis-cli -p 6379 incr visits
+(integer) 1
+$ redis-cli -p 6379 set session:abc Alice EX 60
+OK
+$ redis-cli -p 6379 ttl session:abc
+(integer) 58
 ```
 
-Or use it as an embedded library:
-```bash
-$ java -jar kvstore.jar put hello world
-OK
-$ java -jar kvstore.jar get hello
-world
-# data persists across restarts via the WAL
-```
+---
 
 ## Why this project exists
 
-The public API is small. All the engineering is in the internals — and those internals *are* the core CS fundamentals: balanced/sorted structures, binary search, merge algorithms, amortized complexity, file I/O, concurrency, crash recovery, and a real network protocol.
+The public API is small — a few dozen commands. **All the engineering is in the internals**, and those internals *are* the canonical CS fundamentals: balanced/sorted structures, binary search, merge algorithms, amortized complexity, file I/O, concurrency, crash recovery, a real network protocol, encryption, and authentication.
+
+Most engineers use databases as black boxes. This project demonstrates I can build one — including the tricky parts: crash safety, concurrent flush without write stalls, leveled compaction with bounded read amplification, virtual-thread I/O without carrier pinning, and a wire protocol third-party clients actually speak.
+
+---
+
+## Try it in 30 seconds
+
+```bash
+git clone https://github.com/ethanstoner/kvstore && cd kvstore
+mvn package -DskipTests
+java -jar target/kvstore-0.1.0.jar serve
+
+# In another terminal:
+redis-cli -p 6379 ping
+redis-cli -p 6379 set hello world
+redis-cli -p 6379 get hello
+```
+
+Or use the all-in-one Docker image:
+
+```bash
+docker build -t kvstore .
+docker run -d -p 6379:6379 -v kvdata:/data kvstore
+```
+
+---
+
+## Performance
+
+Measured with [JMH](https://openjdk.org/projects/code-tools/jmh/) on JDK 21 (Microsoft OpenJDK 21.0.11), single-threaded, 100K-key dataset:
+
+| Workload | Throughput |
+|---|---|
+| Sequential write | **~100K ops/sec** |
+| Random write | **~106K ops/sec** |
+| Point read (existing key) | **~131K ops/sec** |
+| Point read (missing key, bloom-filter short-circuit) | **~14.4M ops/sec** |
+| Range scan (100 keys per scan) | **~165K keys/sec** |
+
+The 100× speedup for missing-key lookups is the bloom filter doing its job — most queries skip the disk entirely. Reproduce locally:
+
+```bash
+mvn package
+java -jar target/kvstore-0.1.0-benchmarks.jar
+```
+
+---
+
+## What it does
+
+| Capability | How |
+|---|---|
+| **Persistent key-value storage** | LSM-tree: WAL → memtable → SSTables → leveled compaction |
+| **Redis wire compatibility** | RESP protocol parser/writer, virtual-thread I/O |
+| **Crash safety** | Every write hits the WAL (with CRC32 per record) before it's acknowledged. Verified by a `kill -9` test that recovers 100% of pre-crash writes. |
+| **Bounded read latency** | Leveled compaction (LevelDB-style) + per-file bloom filter + LRU value cache |
+| **Non-blocking writes** | Concurrent flush — memtable swap is O(1); the actual SSTable write happens on a background thread |
+| **Encryption** | TLSv1.3 via `--tls-keystore` |
+| **Authentication** | Multi-user with constant-time password compare + per-user command ACLs |
+| **Pub/Sub** | `SUBSCRIBE`, `PSUBSCRIBE` (glob patterns), `PUBLISH` with async delivery |
+| **TTL** | `SET key val EX 60`, `EXPIRE`, `TTL`, `PERSIST` — expired entries invisible to reads, dropped during compaction |
+| **Backup** | `BGSAVE` produces a point-in-time snapshot file |
+| **Operational** | Connection limits, INFO stats (peak/rejected connections, cache hit rate, snapshot epoch), JMH benchmarks, GitHub Actions CI |
+
+### Full command catalog
+
+```
+Keys/strings:   SET (with EX/PX) · GET · DEL · EXISTS · MGET · MSET · SCAN
+Numeric:        INCR · DECR · INCRBY · DECRBY
+TTL:            EXPIRE · PEXPIRE · TTL · PTTL · PERSIST
+Pub/Sub:        SUBSCRIBE · UNSUBSCRIBE · PSUBSCRIBE · PUNSUBSCRIBE · PUBLISH
+Snapshots:      SAVE · BGSAVE · LASTSAVE
+Server:         AUTH · PING · DBSIZE · INFO · COMMAND · QUIT · SHUTDOWN
+```
+
+---
 
 ## Architecture
 
@@ -46,7 +120,7 @@ The public API is small. All the engineering is in the internals — and those i
   │    (SSL/plain)       (Java 21)                │         │
   │                                               ▼         │
   │                                       AUTH ──► dispatch │
-  │                                       (multi-user)      │
+  │                                       (multi-user/ACL)  │
   └─────────────────────────────┬───────────────────────────┘
                                 │  put / get / delete / scan
                                 ▼
@@ -109,175 +183,143 @@ The public API is small. All the engineering is in the internals — and those i
               that provably don't contain the key)
 ```
 
-Every write is logged to disk **before** it is applied in memory — that ordering is what makes a crash survivable. When the memtable exceeds 4 MB it is atomically swapped to an "immutable" slot and a background thread writes it to an L0 SSTable; new writes continue against a fresh memtable without blocking. Reads check active → immutable → L0 (all files) → L1 (one file, binary search) → L2 (one file) → … with bloom filters skipping levels that can't contain the key. A background thread compacts L_n → L_n+1, dropping tombstones only when they reach the deepest level.
+Every write is logged to disk **before** it is applied in memory — that ordering is what makes a crash survivable. When the memtable exceeds 4 MB it is atomically swapped to an "immutable" slot and a background thread writes it to an L0 SSTable; new writes continue against a fresh memtable without blocking. A background thread compacts L_n → L_n+1, dropping tombstones only when they reach the deepest level.
 
-## Features
+---
 
-- **Redis wire-protocol compatible** — connect with `redis-cli`, `redis-py`, `Jedis`, or any Redis client library
-- **TLS encryption** — optional `SSLServerSocket` via `--tls-keystore`, TLSv1.3
-- **Multi-user authentication + ACLs** — Redis 6-style `AUTH <user> <pass>`, multiple users via `--user name:pass[:cmd1,cmd2,...]`, per-user command allowlists, constant-time password comparison
-- **Pub/Sub** — `SUBSCRIBE`, `PSUBSCRIBE`, `PUBLISH` with glob-pattern matching; subscribed connections receive async messages
-- **Snapshots** — `BGSAVE` / `SAVE` / `LASTSAVE` produce point-in-time backup files (reusing the SSTable format)
-- **Connection limits** — `--max-connections` flag rejects connections beyond the threshold; INFO tracks peak concurrent + rejected counts
-- **Virtual-thread server** — Java 21 vthreads, one per connection, scales to thousands of concurrent clients. SSTable reads use `FileChannel` positional reads (no carrier pinning)
-- **Durable writes** — write-ahead log with fsync and **CRC32 per record** for corruption detection
-- **SSTable flush** — memtable spills to immutable sorted files when full
-- **Multi-level reads** — get/scan falls through memtable → newest SSTable → older ones
-- **Bloom filters** — probabilistic filter per SSTable skips files that can't contain a key (~1% false positive rate)
-- **LRU block cache** — value cache shared across SSTables; hot reads skip the disk seek entirely
-- **Per-value compression** — values > 64 bytes compressed with stdlib Deflate; auto-fallback on incompressible data
-- **Concurrent flush** — non-blocking memtable flush; writes don't stall on disk I/O. Crash-safe via dual-WAL
-- **Leveled compaction** — LevelDB/RocksDB-style: L0 (overlapping) + L1+ (non-overlapping, 10× growth). Bounded read amplification, lower space amp
-- **Atomic DEL** — check-and-delete under the write lock; concurrent clients see accurate counts
-- **Atomic numeric ops** — `INCR`, `DECR`, `INCRBY`, `DECRBY` with overflow detection
-- **TTL / expiration** — `SET key val EX 60`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`. Expired entries are invisible to reads and dropped during compaction
-- **Range scans** — ordered `[from, to)` scans merged across all levels
-- **Crash recovery** — replays WAL on startup (stops at first corrupt record), skips corrupt SSTable files
-- **JMH benchmarks** — measure write/read/scan throughput
+## Design decisions
 
-## Complexity
+A handful of non-obvious engineering choices and the reasoning behind them.
 
-| Operation | Cost | Why |
-|-----------|------|-----|
-| `put` / `delete` | O(log n) + O(1) amortized | sorted skip-list insert + sequential WAL append |
-| `get` | O(log n) per level | memtable → SSTables newest-first, bloom filter skips irrelevant files |
-| `scan(from, to)` | O(log n + k) per level | sub-map lookups merged across levels, k = results |
-| Flush | O(m) | sequential write of m memtable entries to sorted SSTable |
-| Compaction | O(m) | k-way merge of m total entries across selected SSTables |
-| Recovery | O(m) | replay m logged WAL records + open existing SSTables |
+### Leveled compaction over size-tiered
+
+**Size-tiered** (the original choice, since replaced): group SSTables by file size, merge when 4+ of similar size exist. Simple, but reads must check every SSTable; bloom filters help but space amplification is high (the same key can sit in many files).
+
+**Leveled** (LevelDB/RocksDB style): L0 may overlap (4 files max), L1+ have non-overlapping key ranges and grow 10× per level. Reads check at most 4 L0 files + 1 file per level below — bounded read amplification. Compaction does more total work (write amplification), but reads are predictable. The right trade for a read-heavy workload, which is most caches/sessions.
+
+### Concurrent flush over synchronous
+
+The naïve approach: when the memtable fills, write it to disk before accepting more writes. That stalls writers for 10–50 ms on commodity SSDs.
+
+Instead: an atomic swap puts the full memtable into an "immutable" slot in microseconds; a background thread writes it. Reads consult both memtables. Crash safety preserved via a second WAL file (`wal-pending.log`) holding the in-flight memtable's records until the SSTable lands. Writes never stall on disk.
+
+### `FileChannel.read(buffer, position)` instead of `RandomAccessFile`
+
+`RandomAccessFile.seek() + read()` requires `synchronized` to be thread-safe. In JDK 21, `synchronized` blocks **pin the virtual thread's carrier**, defeating the whole "scales to thousands of connections" pitch. `FileChannel.read(ByteBuffer dst, long position)` is stateless and thread-safe — concurrent reads from many vthreads proceed in parallel without pinning.
+
+### Per-value Deflate compression with auto-fallback
+
+Compress values > 64 bytes (smaller values don't compress well — overhead > savings). After compression, compare sizes: if the compressed payload isn't smaller (e.g., random data), store raw. Reader branches on a per-entry op byte, so no file-format version bump was needed. Block cache stores **decompressed** values, so cache hits skip both seek and inflate.
+
+### Single-password AUTH alongside multi-user
+
+The first auth implementation accepted only `--requirepass`. Adding multi-user later threatened to break backward compat. Resolution: internally everyone is a "user" — `--requirepass secret` creates a user named `"default"`. Both `AUTH secret` and `AUTH default secret` work; multi-user is just adding more users. Zero breakage.
+
+### `synchronized` writes for Pub/Sub delivery
+
+When `PUBLISH` arrives, the publisher's vthread iterates subscribers and writes to each subscriber's socket directly. But that socket's `OutputStream` is also being used by the subscriber's own vthread (to write its own command replies). Resolution: a per-connection `writeLock` synchronized object. Subscribers' command loops hold it during `handle() + flush()`; PubSubHub holds it during async deliveries. Simple, correct, minimal overhead — async delivery is rare relative to normal command throughput.
+
+### Snapshots reuse the SSTable format
+
+`BGSAVE` writes a single file containing all current key→value pairs (memtable + immutable + all SSTable levels merged, newest wins, tombstones and expired entries dropped). That file IS a valid SSTable. To restore: stop the server, rename `snapshot-N.db` → `L0-NNNNNN.db`, restart. No special restore code path needed.
+
+---
+
+## Verified to work
+
+| Test | Result |
+|---|---|
+| **203 unit + integration tests** | ✅ All pass on `mvn clean verify` |
+| **End-to-end RESP smoke test** | ✅ 17 commands over real TCP — see `verify.ps1` |
+| **`kill -9` crash recovery** | ✅ 5,000 writes, hard-killed server mid-write, restart → all data present |
+| **JMH performance benchmarks** | ✅ Numbers above |
+| **Concurrent vthread reads** | ✅ 100 vthreads × 50 reads against shared SSTable — no errors, correct values |
+| **Concurrent writers under flush** | ✅ 4 vthreads × 5,000 writes during background flush — no lost writes |
+| **WAL corruption handling** | ✅ Flip a byte mid-log → replay stops cleanly, prior records survive |
+
+---
 
 ## Build & run
 
 Requires JDK 21+ and Maven.
 
 ```bash
-mvn verify                    # compile + run the full test suite
-mvn package                   # build target/kvstore-0.1.0.jar
+mvn verify                          # compile + run the full test suite
+mvn package                         # build target/kvstore-0.1.0.jar
 ```
 
-### With Docker
-
-```bash
-# Build the image
-docker build -t kvstore .
-
-# Run the server (data persisted to a Docker volume)
-docker run -d --name kvstore -p 6379:6379 -v kvdata:/data kvstore
-
-# Connect from anywhere with a Redis client
-redis-cli -p 6379 ping
-redis-cli -p 6379 set hello world
-redis-cli -p 6379 get hello
-
-# With auth + TLS:
-docker run -d --name kvstore -p 6379:6379 -v kvdata:/data \
-    -v /path/to/kv.jks:/certs/kv.jks:ro \
-    kvstore serve --port 6379 --data /data \
-    --user alice:secret1 --user bob:secret2 \
-    --tls-keystore /certs/kv.jks --tls-keystore-pass changeit
-
-# Tail logs
-docker logs -f kvstore
-
-# Stop
-docker stop kvstore
-```
-
-The image runs as a non-root user, exposes port 6379, and stores all data under `/data` (declared as a volume).
-
-### As a network server (Redis-compatible)
+### As a network server
 
 ```bash
 java -jar target/kvstore-0.1.0.jar serve                              # port 6379, no auth
 java -jar target/kvstore-0.1.0.jar serve --port 6380                  # different port
-java -jar target/kvstore-0.1.0.jar serve --data /var/kv               # different data dir
+java -jar target/kvstore-0.1.0.jar serve --data /var/kv               # custom data dir
 java -jar target/kvstore-0.1.0.jar serve --requirepass topsecret      # single password
 java -jar target/kvstore-0.1.0.jar serve --user alice:s1 --user bob:s2  # multi-user
-java -jar target/kvstore-0.1.0.jar serve --user reader:s1:GET,EXISTS,MGET   # read-only ACL
-java -jar target/kvstore-0.1.0.jar serve --max-connections 1000             # connection cap
+java -jar target/kvstore-0.1.0.jar serve --user reader:s1:GET,EXISTS,MGET  # read-only ACL
+java -jar target/kvstore-0.1.0.jar serve --max-connections 1000       # connection cap
 java -jar target/kvstore-0.1.0.jar serve --tls-keystore kv.jks --tls-keystore-pass changeit  # TLS
-
-# In another terminal — works with any Redis client:
-redis-cli -p 6379 ping                       # PONG
-redis-cli -p 6379 set hello world            # OK
-redis-cli -p 6379 get hello                  # "world"
-redis-cli -p 6379 mget hello missing         # 1) "world"  2) (nil)
-redis-cli -p 6379 info                       # server / stats / storage / cache
-redis-cli -p 6379 shutdown                   # graceful stop
-
-# With auth:
-redis-cli -p 6379 -a topsecret get hello              # AUTH <password>
-redis-cli -p 6379 --user alice --pass s1 get hello    # AUTH <user> <password>
-redis-cli -p 6379 get hello                           # (error) NOAUTH Authentication required.
-
-# With TLS:
-redis-cli -p 6379 --tls --cacert ca.crt ping          # encrypted handshake
 ```
 
-Supported commands:
-- **Keys/strings**: `SET` (with `EX`/`PX`), `GET`, `DEL`, `EXISTS`, `MGET`, `MSET`
-- **Numeric**: `INCR`, `DECR`, `INCRBY`, `DECRBY`
-- **TTL**: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`
-- **Pub/Sub**: `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`
-- **Snapshot**: `SAVE`, `BGSAVE`, `LASTSAVE`
-- **Scan**: `SCAN from to` (range scan, not cursor)
-- **Server**: `AUTH`, `PING`, `DBSIZE`, `INFO`, `COMMAND`, `QUIT`, `SHUTDOWN`
-
-### As an embedded one-shot CLI
+Use any Redis client:
 
 ```bash
-java -jar target/kvstore-0.1.0.jar put hello world
-java -jar target/kvstore-0.1.0.jar get hello
-java -jar target/kvstore-0.1.0.jar scan a z
-java -jar target/kvstore-0.1.0.jar del hello
+redis-cli -p 6379 ping                                # → PONG
+redis-cli -p 6379 set hello world                     # → OK
+redis-cli -p 6379 mget hello missing                  # → 1) "world"  2) (nil)
+redis-cli -p 6379 info                                # → server / stats / storage / cache
+redis-cli -p 6379 -a topsecret get hello              # AUTH <password>
+redis-cli -p 6379 --user alice --pass s1 get hello    # AUTH <user> <password>
+redis-cli -p 6379 --tls --cacert ca.crt ping          # TLS handshake
 ```
 
 ### As a Java library
 
 ```java
 try (KvStore db = new KvStore(Path.of("/var/data/myapp"))) {
-    db.put("user:42", "{...json...}");
+    db.put("user:42", "Ethan");
+    db.put("session:abc", "user:42", System.currentTimeMillis() + 60_000); // TTL
     String user = db.get("user:42").orElse(null);
-    Map<String, String> users = db.scan("user:", "user;");
-    db.delete("user:42");
+    long visits = db.incrementBy("counter", 1);
+    Map<String, String> all = db.scan("user:", "user;");
 }
 ```
 
-## Benchmarks
+### As a Docker container
 
 ```bash
-mvn package
-java -jar target/kvstore-0.1.0-benchmarks.jar           # run all benchmarks
-java -jar target/kvstore-0.1.0-benchmarks.jar ".*Read.*" # run only read benchmarks
+docker build -t kvstore .
+docker run -d --name kvstore -p 6379:6379 -v kvdata:/data kvstore
+
+# With auth + TLS + data persisted to a host volume:
+docker run -d --name kvstore -p 6379:6379 -v $(pwd)/data:/data \
+    -v $(pwd)/kv.jks:/certs/kv.jks:ro \
+    kvstore serve --port 6379 --data /data \
+    --user alice:secret1 --user bob:secret2 \
+    --tls-keystore /certs/kv.jks --tls-keystore-pass changeit
 ```
 
-Measured with JMH (Java Microbenchmark Harness):
+The image runs as a non-root user, exposes port 6379, and stores data under `/data`.
 
-| Benchmark | What it measures |
-|-----------|-----------------|
-| `sequentialWrite` | Sequential key inserts (best case for LSM) |
-| `randomWrite` | Random key inserts/updates |
-| `pointReadExistingKey` | Reads of keys known to exist |
-| `pointReadMissingKey` | Reads of keys that don't exist (bloom filter path) |
-| `scanRange` | Range scans of ~100 keys |
+---
 
-## Layout
+## Code organization
 
 ```
 src/main/java/com/ethanstoner/kvstore/
   Memtable.java          sorted in-memory buffer (skip list)
-  WriteAheadLog.java     append-only durability + replay
-  SSTable.java           immutable sorted file (binary format + bloom filter + index)
+  ValueEntry.java        value + expiration timestamp (record)
+  WriteAheadLog.java     append-only durability + replay (CRC32)
+  SSTable.java           immutable sorted file (binary + bloom + index + compression)
   BloomFilter.java       probabilistic set membership (MurmurHash3)
   BlockCache.java        thread-safe LRU value cache shared across SSTables
-  KvStore.java           ties it together; public API + flush + compaction + snapshots
-  ValueEntry.java        record holding value + expiration timestamp (TTL)
+  KvStore.java           public API + flush + compaction + snapshots
   server/
     KvServer.java        TCP server, accept loop, graceful shutdown, connection limits
     ClientConnection.java  per-connection vthread loop, subscribe state, auth state
-    CommandHandler.java  dispatches RESP commands to KvStore + PubSubHub
+    CommandHandler.java  RESP command dispatch
     PubSubHub.java       channel/pattern subscription routing
-    UserStore.java       users + passwords + per-user command allowlists
+    UserStore.java       users + passwords + per-user command ACLs
     AuthState.java       interface implemented by ClientConnection
     TlsConfig.java       TLSv1.3 keystore loader
     resp/
@@ -289,21 +331,23 @@ src/main/java/com/ethanstoner/kvstore/
     ServeCommand.java    starts the network server
   benchmark/
     KvStoreBenchmark.java  JMH throughput benchmarks
-src/test/java/...        JUnit 5 suite: memtable, WAL, SSTable, bloom filter,
-                         recovery, compaction, RESP codec, command handler,
-                         server integration
-.github/workflows/       CI
+
+src/test/java/...      203 JUnit 5 tests covering every module
+.github/workflows/     CI
+Dockerfile             multi-stage build
 ```
+
+---
 
 ## Roadmap
 
-Potential future work:
+Tracked stretch goals (the current project is feature-complete as a single-node Redis-compatible store):
 
-- **Replication / streaming WAL** — master/replica protocol for multi-node durability
-- **Sharding** — multiple nodes, hashed key range partitioning
-- **Block-level (not per-value) compression** — better ratio for small values
-- **Replication / streaming WAL** — multi-node durability via a follower protocol
-- **Sharding** — multiple nodes, hashed key range partitioning
+- **Replication** — master/replica streaming WAL for multi-node durability (~1 week MVP, multi-week for failover)
+- **Sharding** — hash-partitioned multi-node clusters
+- **Block-level compression** — better ratio than per-value for small values
+
+---
 
 ## License
 
