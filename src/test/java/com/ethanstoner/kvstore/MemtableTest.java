@@ -50,7 +50,7 @@ class MemtableTest {
         m.put("apple", "a");
         m.put("cherry", "c");
         List<String> keys = new ArrayList<>();
-        for (Map.Entry<String, String> e : m.entries()) {
+        for (Map.Entry<String, ValueEntry> e : m.entries().entrySet()) {
             keys.add(e.getKey());
         }
         assertEquals(List.of("apple", "banana", "cherry"), keys);
@@ -79,5 +79,23 @@ class MemtableTest {
         assertTrue(m.isEmpty());
         m.put("key", "value");
         assertTrue(m.approximateBytes() > 0);
+    }
+
+    @Test
+    void getEntryReturnsValueAndExpiry() {
+        Memtable m = new Memtable();
+        long expiry = System.currentTimeMillis() + 60_000;
+        m.put("k", "v", expiry);
+        ValueEntry e = m.getEntry("k");
+        assertEquals("v", e.value());
+        assertEquals(expiry, e.expiresAtMs());
+    }
+
+    @Test
+    void getEntryWithNoExpiryReturnsNever() {
+        Memtable m = new Memtable();
+        m.put("k", "v");
+        ValueEntry e = m.getEntry("k");
+        assertEquals(ValueEntry.NEVER, e.expiresAtMs());
     }
 }

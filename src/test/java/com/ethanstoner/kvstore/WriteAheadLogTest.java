@@ -14,11 +14,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class WriteAheadLogTest {
 
-    /** Replays the log into a map; null value = delete (key removed). */
+    /**
+     * Replays the log into a map; null value = delete (key removed).
+     * Uses the new TriConsumer signature; the expiresAtMs argument is ignored here
+     * since these tests only care about key/value correctness.
+     */
     private Map<String, String> replayInto(Path logPath) throws IOException {
         Map<String, String> state = new LinkedHashMap<>();
         try (WriteAheadLog wal = new WriteAheadLog(logPath)) {
-            wal.replay((k, v) -> {
+            wal.replay((k, v, expiresAtMs) -> {
                 if (v == null) {
                     state.remove(k);
                 } else {
@@ -143,5 +147,36 @@ class WriteAheadLogTest {
         try (WriteAheadLog wal = new WriteAheadLog(log)) {}
         Map<String, String> state = replayInto(log);
         assertTrue(state.isEmpty());
+    }
+
+    @Test
+    void appendPutWithExpiryReplaysWithCorrectExpiry(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+        long expiry = System.currentTimeMillis() + 60_000;
+        try (WriteAheadLog wal = new WriteAheadLog(log)) {
+            wal.appendPut("k", "v", expiry);
+        }
+        Map<String, Long> expiryMap = new LinkedHashMap<>();
+        try (WriteAheadLog wal = new WriteAheadLog(log)) {
+            wal.replay((k, v, expiresAtMs) -> {
+                if (v != null) expiryMap.put(k, expiresAtMs);
+            });
+        }
+        assertEquals(expiry, expiryMap.get("k"));
+    }
+
+    @Test
+    void appendPutWithoutExpiryReplaysAsNever(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+        try (WriteAheadLog wal = new WriteAheadLog(log)) {
+            wal.appendPut("k", "v"); // no expiry
+        }
+        Map<String, Long> expiryMap = new LinkedHashMap<>();
+        try (WriteAheadLog wal = new WriteAheadLog(log)) {
+            wal.replay((k, v, expiresAtMs) -> {
+                if (v != null) expiryMap.put(k, expiresAtMs);
+            });
+        }
+        assertEquals(ValueEntry.NEVER, expiryMap.get("k"));
     }
 }

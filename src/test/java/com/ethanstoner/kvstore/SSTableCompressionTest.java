@@ -48,9 +48,12 @@ class SSTableCompressionTest {
         );
         SSTable.write(file, entries);
         try (SSTable sst = SSTable.open(file)) {
-            assertEquals(java.util.Optional.of("small"), sst.get("a"));
-            assertEquals(java.util.Optional.of(big), sst.get("b"));
-            assertEquals(java.util.Optional.of("x".repeat(500)), sst.get("c"));
+            assertEquals(java.util.Optional.of("small"),
+                    sst.get("a").map(ValueEntry::value));
+            assertEquals(java.util.Optional.of(big),
+                    sst.get("b").map(ValueEntry::value));
+            assertEquals(java.util.Optional.of("x".repeat(500)),
+                    sst.get("c").map(ValueEntry::value));
         }
     }
 
@@ -69,7 +72,8 @@ class SSTableCompressionTest {
         SSTable.write(file, List.of(Map.entry("rand", random)));
         try (SSTable sst = SSTable.open(file)) {
             // Round-trip must work whether stored raw or compressed.
-            assertEquals(java.util.Optional.of(random), sst.get("rand"));
+            assertEquals(java.util.Optional.of(random),
+                    sst.get("rand").map(ValueEntry::value));
         }
     }
 
@@ -91,11 +95,11 @@ class SSTableCompressionTest {
         try (SSTable sst = SSTable.open(file)) {
             for (int i = 0; i < 10; i++) {
                 assertEquals(java.util.Optional.of("v" + i),
-                        sst.get(String.format("small-%03d", i)));
+                        sst.get(String.format("small-%03d", i)).map(ValueEntry::value));
             }
             for (int i = 0; i < 5; i++) {
                 assertEquals(java.util.Optional.of(("payload-" + i + " ").repeat(20)),
-                        sst.get(String.format("zlarge-%03d", i)));
+                        sst.get(String.format("zlarge-%03d", i)).map(ValueEntry::value));
             }
         }
     }

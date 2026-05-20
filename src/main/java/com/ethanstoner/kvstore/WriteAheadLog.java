@@ -11,7 +11,6 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.function.BiConsumer;
 import java.util.zip.CRC32;
 
 /**
@@ -30,10 +29,18 @@ import java.util.zip.CRC32;
  * <p>Record format (binary, one frame per mutation):
  * <pre>
  *   int (4 bytes BE)   recordLen  — byte length of the payload that follows
- *   byte[recordLen]    payload    — op byte + writeUTF(key) [+ writeUTF(value)]
+ *   byte[recordLen]    payload    — op byte + writeUTF(key) [+ writeUTF(value) + 8-byte expiresAtMs]
  *                                   op: 0 = DELETE, 1 = PUT
  *   int (4 bytes BE)   crc32      — CRC32 checksum of the payload bytes
  * </pre>
+ *
+ * <p>PUT payload format (new, with TTL):
+ * <pre>
+ *   [op=1][writeUTF(key)][writeUTF(value)][expiresAtMs as 8 bytes BE]
+ * </pre>
+ *
+ * <p>Old PUT records without the 8-byte expiry trailer are still supported on
+ * replay; they are treated as NEVER-expiring entries.
  *
  * <p>On replay, any truncated tail (short read) or CRC mismatch is treated as
  * corruption: replay stops at the first bad frame, preserving all records that
@@ -43,6 +50,16 @@ public final class WriteAheadLog implements AutoCloseable {
 
     private static final byte OP_DELETE = 0;
     private static final byte OP_PUT    = 1;
+
+    /**
+     * Three-argument functional interface used for WAL replay.
+     * A {@code null} value indicates a DELETE; {@code expiresAtMs} is only
+     * meaningful when value is non-null.
+     */
+    @FunctionalInterface
+    public interface TriConsumer {
+        void accept(String key, String value, long expiresAtMs) throws IOException;
+    }
 
     private final Path path;
     private final DataOutputStream out;
@@ -58,12 +75,19 @@ public final class WriteAheadLog implements AutoCloseable {
                 new BufferedOutputStream(new FileOutputStream(path.toFile(), !truncate)));
     }
 
+    /** Appends a PUT record with no expiry (backward-compatible overload). */
     public synchronized void appendPut(String key, String value) throws IOException {
+        appendPut(key, value, ValueEntry.NEVER);
+    }
+
+    /** Appends a PUT record with an absolute expiry timestamp in epoch milliseconds. */
+    public synchronized void appendPut(String key, String value, long expiresAtMs) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         DataOutputStream dos = new DataOutputStream(baos);
         dos.writeByte(OP_PUT);
         dos.writeUTF(key);
         dos.writeUTF(value);
+        dos.writeLong(expiresAtMs);
         dos.flush();
         writeFramedRecord(baos.toByteArray());
     }
@@ -90,15 +114,18 @@ public final class WriteAheadLog implements AutoCloseable {
     }
 
     /**
-     * Replays every record in order into {@code apply}, which receives
-     * {@code (key, value)} where a {@code null} value means a delete.
-     * Called once on startup to rebuild the memtable.
+     * Replays every record in order into {@code apply} (TriConsumer version).
+     * A {@code null} value indicates a delete; {@code expiresAtMs} is only
+     * meaningful when value is non-null.
+     *
+     * <p>Old PUT records without the 8-byte expiry trailer are replayed with
+     * {@code expiresAtMs == ValueEntry.NEVER} for backward compatibility.
      *
      * <p>Replay is fault-tolerant: a truncated tail or a CRC mismatch causes
      * replay to stop cleanly (the record and everything after it is discarded).
      * This correctly handles the case where the process crashed mid-write.
      */
-    public void replay(BiConsumer<String, String> apply) throws IOException {
+    public void replay(TriConsumer apply) throws IOException {
         if (!Files.exists(path)) {
             return;
         }
@@ -155,9 +182,19 @@ public final class WriteAheadLog implements AutoCloseable {
                 byte op = payloadIn.readByte();
                 String key = payloadIn.readUTF();
                 if (op == OP_PUT) {
-                    apply.accept(key, payloadIn.readUTF());
+                    String value = payloadIn.readUTF();
+                    // Determine how many bytes remain in the payload for the expiry long.
+                    // A fresh PUT record always has 8 bytes for expiresAtMs.
+                    // Old-format records (without TTL) won't have those bytes.
+                    long expiresAtMs;
+                    if (payloadIn.available() >= 8) {
+                        expiresAtMs = payloadIn.readLong();
+                    } else {
+                        expiresAtMs = ValueEntry.NEVER;
+                    }
+                    apply.accept(key, value, expiresAtMs);
                 } else {
-                    apply.accept(key, null);
+                    apply.accept(key, null, ValueEntry.NEVER);
                 }
             }
         }

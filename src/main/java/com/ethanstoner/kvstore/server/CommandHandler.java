@@ -1,6 +1,7 @@
 package com.ethanstoner.kvstore.server;
 
 import com.ethanstoner.kvstore.KvStore;
+import com.ethanstoner.kvstore.ValueEntry;
 import com.ethanstoner.kvstore.server.resp.RespWriter;
 
 import java.io.IOException;
@@ -65,6 +66,11 @@ public final class CommandHandler {
                 case "DECRBY"   -> incrByWithArg(args, out, "DECRBY", true);
                 case "DBSIZE"   -> dbsize(args, out);
                 case "INFO"     -> info(args, out);
+                case "EXPIRE"   -> expire(args, out, false);
+                case "PEXPIRE"  -> expire(args, out, true);
+                case "TTL"      -> ttl(args, out, false);
+                case "PTTL"     -> ttl(args, out, true);
+                case "PERSIST"  -> persist(args, out);
                 case "COMMAND"  -> RespWriter.writeArray(out, List.of());
                 case "QUIT"     -> RespWriter.writeSimpleString(out, "OK");
                 case "SHUTDOWN" -> shutdown(out);
@@ -96,7 +102,6 @@ public final class CommandHandler {
         String username;
         String password;
         if (args.length == 2) {
-            // Implicit "default" user — backward-compatible single-password mode
             username = "default";
             password = args[1];
         } else {
@@ -120,8 +125,27 @@ public final class CommandHandler {
     }
 
     private void set(String[] args, OutputStream out) throws IOException {
-        if (args.length != 3) { wrongArity(out, "SET"); return; }
-        store.put(args[1], args[2]);
+        if (args.length < 3) { wrongArity(out, "SET"); return; }
+        long expiresAtMs = ValueEntry.NEVER;
+        // Parse optional EX / PX options
+        for (int i = 3; i < args.length; i++) {
+            String opt = args[i].toUpperCase(Locale.ROOT);
+            if ((opt.equals("EX") || opt.equals("PX")) && i + 1 < args.length) {
+                long n;
+                try { n = Long.parseLong(args[i + 1]); }
+                catch (NumberFormatException e) {
+                    RespWriter.writeError(out, "ERR value is not an integer or out of range");
+                    return;
+                }
+                long millis = opt.equals("EX") ? n * 1000L : n;
+                expiresAtMs = System.currentTimeMillis() + millis;
+                i++; // skip the argument value
+            } else {
+                RespWriter.writeError(out, "ERR syntax error");
+                return;
+            }
+        }
+        store.put(args[1], args[2], expiresAtMs);
         RespWriter.writeSimpleString(out, "OK");
     }
 
@@ -231,6 +255,32 @@ public final class CommandHandler {
         } catch (ArithmeticException e) {
             RespWriter.writeError(out, "ERR increment or decrement would overflow");
         }
+    }
+
+    private void expire(String[] args, OutputStream out, boolean millis) throws IOException {
+        if (args.length != 3) { wrongArity(out, millis ? "PEXPIRE" : "EXPIRE"); return; }
+        long n;
+        try { n = Long.parseLong(args[2]); }
+        catch (NumberFormatException e) {
+            RespWriter.writeError(out, "ERR value is not an integer or out of range");
+            return;
+        }
+        long expiresAtMs = System.currentTimeMillis() + (millis ? n : n * 1000L);
+        boolean ok = store.expire(args[1], expiresAtMs);
+        RespWriter.writeInteger(out, ok ? 1 : 0);
+    }
+
+    private void ttl(String[] args, OutputStream out, boolean millis) throws IOException {
+        if (args.length != 2) { wrongArity(out, millis ? "PTTL" : "TTL"); return; }
+        long remaining = store.ttl(args[1]);
+        if (remaining < 0) { RespWriter.writeInteger(out, remaining); return; }
+        RespWriter.writeInteger(out, millis ? remaining : remaining / 1000L);
+    }
+
+    private void persist(String[] args, OutputStream out) throws IOException {
+        if (args.length != 2) { wrongArity(out, "PERSIST"); return; }
+        boolean removed = store.persist(args[1]);
+        RespWriter.writeInteger(out, removed ? 1 : 0);
     }
 
     private static void wrongArity(OutputStream out, String cmd) throws IOException {

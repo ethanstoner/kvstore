@@ -17,11 +17,13 @@ import java.util.regex.Pattern;
  * <p>File layout (big-endian):
  * <pre>
  * [Data Section]  — one entry per key, sorted
- *   op:       1 byte   (0 = TOMBSTONE, 1 = VALUE)
+ *   op:       1 byte   (0 = TOMBSTONE, 1 = VALUE, 2 = VALUE_DEFLATE,
+ *                        3 = VALUE_TTL, 4 = VALUE_DEFLATE_TTL)
  *   keyLen:   2 bytes  (unsigned short)
  *   key:      keyLen bytes (UTF-8)
- *   valueLen: 4 bytes  (only when op = VALUE)
- *   value:    valueLen bytes (only when op = VALUE)
+ *   valueLen: 4 bytes  (only when op != TOMBSTONE)
+ *   value:    valueLen bytes (only when op != TOMBSTONE)
+ *   expiry:   8 bytes  (only when op = VALUE_TTL or VALUE_DEFLATE_TTL)
  *
  * [Bloom Filter Section]  — serialized by BloomFilter.writeTo
  *
@@ -50,9 +52,11 @@ public final class SSTable implements AutoCloseable {
 
     private static final int  MAGIC        = 0x4B565354; // "KVST"
     private static final int  FOOTER_BYTES = 24;
-    private static final byte OP_TOMBSTONE      = 0;
-    private static final byte OP_VALUE          = 1;
-    private static final byte OP_VALUE_DEFLATE  = 2;
+    private static final byte OP_TOMBSTONE         = 0;
+    private static final byte OP_VALUE             = 1;
+    private static final byte OP_VALUE_DEFLATE     = 2;
+    private static final byte OP_VALUE_TTL         = 3;  // value + 8-byte expiry trailer
+    private static final byte OP_VALUE_DEFLATE_TTL = 4;  // compressed value + 8-byte expiry trailer
 
     /** Values whose UTF-8 byte length exceeds this threshold are compressed. */
     private static final int COMPRESS_THRESHOLD_BYTES = 64;
@@ -92,32 +96,32 @@ public final class SSTable implements AutoCloseable {
     }
 
     // =========================================================================
-    // Static factory: write
+    // Static factory: write (ValueEntry-aware primary version)
     // =========================================================================
 
     /**
-     * Writes {@code sortedEntries} to {@code file} in SSTable format.
+     * Writes {@code sortedEntries} (key → {@link ValueEntry}) to {@code file} in SSTable format.
      *
      * <p>Entries must already be sorted by key (ascending). Tombstones are
-     * written with {@code op = 0}; normal values with {@code op = 1}.
+     * written with {@code op = 0}; normal values with op = 1 or 2 (or 3/4 if TTL is set).
      *
      * @param file          destination path (will be created / overwritten)
-     * @param sortedEntries key-value pairs in ascending key order
+     * @param sortedEntries key-value entries in ascending key order
      * @throws IOException on any I/O failure
      */
     public static void write(Path file,
-                             Iterable<Map.Entry<String, String>> sortedEntries)
+                             Iterable<Map.Entry<String, ValueEntry>> sortedEntries)
             throws IOException {
 
         // Collect entries so we can count them for the bloom filter.
-        List<Map.Entry<String, String>> entries = new ArrayList<>();
-        for (Map.Entry<String, String> e : sortedEntries) {
+        List<Map.Entry<String, ValueEntry>> entries = new ArrayList<>();
+        for (Map.Entry<String, ValueEntry> e : sortedEntries) {
             entries.add(e);
         }
 
         // Build bloom filter over all keys.
         BloomFilter bf = new BloomFilter(Math.max(1, entries.size()), 0.01);
-        for (Map.Entry<String, String> e : entries) {
+        for (Map.Entry<String, ValueEntry> e : entries) {
             bf.add(e.getKey());
         }
 
@@ -142,9 +146,11 @@ public final class SSTable implements AutoCloseable {
 
             for (int i = 0; i < entries.size(); i++) {
                 dataOffsets[i] = pos;
-                Map.Entry<String, String> e = entries.get(i);
-                String key   = e.getKey();
-                String value = e.getValue();
+                Map.Entry<String, ValueEntry> e = entries.get(i);
+                String key        = e.getKey();
+                ValueEntry entry  = e.getValue();
+                String value      = entry.value();
+                long expiresAtMs  = entry.expiresAtMs();
 
                 byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
                 boolean isTombstone = Memtable.TOMBSTONE.equals(value);
@@ -157,27 +163,42 @@ public final class SSTable implements AutoCloseable {
                 } else {
                     byte[] valBytes = value.getBytes(StandardCharsets.UTF_8);
                     byte[] payload;
-                    byte op;
+                    boolean compressed = false;
                     if (valBytes.length > COMPRESS_THRESHOLD_BYTES) {
-                        byte[] compressed = deflate(valBytes);
-                        if (compressed.length < valBytes.length) {
-                            op      = OP_VALUE_DEFLATE;
-                            payload = compressed;
+                        byte[] compressedBytes = deflate(valBytes);
+                        if (compressedBytes.length < valBytes.length) {
+                            payload    = compressedBytes;
+                            compressed = true;
                         } else {
-                            // Compression didn't help (e.g. already-random data). Store raw.
-                            op      = OP_VALUE;
                             payload = valBytes;
                         }
                     } else {
-                        op      = OP_VALUE;
                         payload = valBytes;
                     }
+
+                    boolean hasTtl = expiresAtMs != ValueEntry.NEVER;
+                    byte op;
+                    if (!compressed && !hasTtl) {
+                        op = OP_VALUE;
+                    } else if (compressed && !hasTtl) {
+                        op = OP_VALUE_DEFLATE;
+                    } else if (!compressed) {
+                        op = OP_VALUE_TTL;
+                    } else {
+                        op = OP_VALUE_DEFLATE_TTL;
+                    }
+
                     out.writeByte(op);
                     out.writeShort(keyBytes.length);
                     out.write(keyBytes);
                     out.writeInt(payload.length);
                     out.write(payload);
                     pos += 1 + 2 + keyBytes.length + 4 + payload.length;
+
+                    if (hasTtl) {
+                        out.writeLong(expiresAtMs);
+                        pos += 8;
+                    }
                 }
             }
 
@@ -209,6 +230,35 @@ public final class SSTable implements AutoCloseable {
             out.flush();
             fos.getFD().sync();
         }
+    }
+
+    /**
+     * Legacy overload accepting {@code String} values — wraps each in a
+     * {@link ValueEntry} with {@code NEVER} expiry.  Provided for backward
+     * compatibility with existing test code that uses the old String-based API.
+     * This is an alias for {@link #write(Path, Iterable)} when the entries use
+     * plain Strings rather than {@link ValueEntry}.
+     */
+    public static void writeStrings(Path file,
+                                    Iterable<Map.Entry<String, String>> sortedEntries)
+            throws IOException {
+        List<Map.Entry<String, ValueEntry>> wrapped = new ArrayList<>();
+        for (Map.Entry<String, String> e : sortedEntries) {
+            wrapped.add(Map.entry(e.getKey(), new ValueEntry(e.getValue(), ValueEntry.NEVER)));
+        }
+        write(file, wrapped);
+    }
+
+    /**
+     * Overload that accepts plain {@code String} values for backward compatibility
+     * with test code that was written before TTL support was added.
+     * Each value is stored with {@link ValueEntry#NEVER} expiry.
+     */
+    @SuppressWarnings("unchecked")
+    public static void write(Path file,
+                             List<Map.Entry<String, String>> sortedEntries)
+            throws IOException {
+        writeStrings(file, sortedEntries);
     }
 
     // =========================================================================
@@ -324,10 +374,11 @@ public final class SSTable implements AutoCloseable {
      * Point lookup.
      *
      * <p>Returns {@code Optional.empty()} when the key is definitely absent
-     * (bloom filter miss or index miss). Returns {@code Optional.of(value)}
-     * for a live value and {@code Optional.of(TOMBSTONE)} for a deleted key.
+     * (bloom filter miss or index miss). Returns a {@link ValueEntry} for a
+     * live value (or a tombstone entry whose {@code value()} equals
+     * {@link Memtable#TOMBSTONE}).
      */
-    public Optional<String> get(String key) throws IOException {
+    public Optional<ValueEntry> get(String key) throws IOException {
         if (!bloom.mightContain(key)) {
             return Optional.empty();
         }
@@ -335,8 +386,8 @@ public final class SSTable implements AutoCloseable {
         if (offset == null) {
             return Optional.empty();
         }
-        String value = readValueAt(offset);
-        return Optional.of(value);
+        ValueEntry entry = readValueAt(offset);
+        return Optional.of(entry);
     }
 
     /**
@@ -345,11 +396,11 @@ public final class SSTable implements AutoCloseable {
      * <p>Tombstones are included in the result (callers must filter them out
      * if needed, e.g. during compaction or in {@link KvStore}).
      */
-    public NavigableMap<String, String> scan(String from, String to)
+    public NavigableMap<String, ValueEntry> scan(String from, String to)
             throws IOException {
         NavigableMap<String, Long> subIndex =
                 index.subMap(from, true, to, false);
-        TreeMap<String, String> result = new TreeMap<>();
+        TreeMap<String, ValueEntry> result = new TreeMap<>();
         for (Map.Entry<String, Long> e : subIndex.entrySet()) {
             result.put(e.getKey(), readValueAt(e.getValue()));
         }
@@ -541,20 +592,20 @@ public final class SSTable implements AutoCloseable {
     }
 
     /**
-     * Reads the value (or tombstone sentinel) stored at the given absolute
-     * file offset. Checks the {@link BlockCache} before reading; populates
-     * the cache on a miss.
+     * Reads the {@link ValueEntry} stored at the given absolute file offset.
+     * Checks the {@link BlockCache} (keyed by raw value string) before reading;
+     * populates the cache on a miss.
      *
      * <p>Uses {@link FileChannel#read(ByteBuffer, long)} — a stateless
      * positional read that does NOT modify the channel's position. Concurrent
      * calls from many virtual threads proceed without any locking, eliminating
      * carrier-thread pinning.
      */
-    private String readValueAt(long offset) throws IOException {
-        if (cache != null) {
-            String cached = cache.get(sequenceNum(), offset);
-            if (cached != null) return cached;
-        }
+    private ValueEntry readValueAt(long offset) throws IOException {
+        // Cache is keyed only by the raw value string (no expiry stored in cache).
+        // We always read the full entry from disk to get the expiry.
+        // The cache is still useful for avoiding repeated decompression of the value bytes.
+        String cachedValue = (cache != null) ? cache.get(sequenceNum(), offset) : null;
 
         // Read op + keyLen header (3 bytes): 1 byte op + 2 bytes keyLen
         ByteBuffer header = ByteBuffer.allocate(3);
@@ -566,37 +617,54 @@ public final class SSTable implements AutoCloseable {
         // Skip past the key bytes to reach the value section
         long pos = offset + 3 + kLen;
 
-        String value;
         if (op == OP_TOMBSTONE) {
-            value = Memtable.TOMBSTONE;
-        } else {
-            // Read valueLen (4 bytes)
-            ByteBuffer vLenBuf = ByteBuffer.allocate(4);
-            readFully(channel, vLenBuf, pos);
-            vLenBuf.flip();
-            int vLen = vLenBuf.getInt();
-            pos += 4;
+            return new ValueEntry(Memtable.TOMBSTONE, ValueEntry.NEVER);
+        }
 
-            // Read value bytes
+        // Read valueLen (4 bytes)
+        ByteBuffer vLenBuf = ByteBuffer.allocate(4);
+        readFully(channel, vLenBuf, pos);
+        vLenBuf.flip();
+        int vLen = vLenBuf.getInt();
+        pos += 4;
+
+        // Read value bytes (use cached string if available to avoid re-decompression)
+        String value;
+        if (cachedValue != null) {
+            // Skip past value bytes and expiry; we already have the value string
+            pos += vLen;
+            value = cachedValue;
+        } else {
             ByteBuffer vBuf = ByteBuffer.allocate(vLen);
             readFully(channel, vBuf, pos);
             vBuf.flip();
             byte[] vBytes = new byte[vLen];
             vBuf.get(vBytes);
+            pos += vLen;
 
-            if (op == OP_VALUE_DEFLATE) {
+            if (op == OP_VALUE_DEFLATE || op == OP_VALUE_DEFLATE_TTL) {
                 byte[] decompressed = inflate(vBytes);
                 value = new String(decompressed, StandardCharsets.UTF_8);
-            } else if (op == OP_VALUE) {
+            } else if (op == OP_VALUE || op == OP_VALUE_TTL) {
                 value = new String(vBytes, StandardCharsets.UTF_8);
             } else {
                 throw new IOException("unknown op byte: " + op);
             }
+
+            if (cache != null) {
+                cache.put(sequenceNum(), offset, value);
+            }
         }
 
-        if (cache != null) {
-            cache.put(sequenceNum(), offset, value);
+        // Read expiry if present
+        long expiresAtMs = ValueEntry.NEVER;
+        if (op == OP_VALUE_TTL || op == OP_VALUE_DEFLATE_TTL) {
+            ByteBuffer expBuf = ByteBuffer.allocate(8);
+            readFully(channel, expBuf, pos);
+            expBuf.flip();
+            expiresAtMs = expBuf.getLong();
         }
-        return value;
+
+        return new ValueEntry(value, expiresAtMs);
     }
 }

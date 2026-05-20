@@ -398,4 +398,71 @@ class CommandHandlerTest {
         String r2 = run("INCRBY", "x");
         assertTrue(r2.startsWith("-ERR"), r2);
     }
+
+    // ── TTL / expiration tests ───────────────────────────────────────────────
+
+    @Test
+    void setWithExSetsTtl() throws IOException {
+        assertEquals("+OK\r\n", run("SET", "k", "v", "EX", "60"));
+        String ttlReply = run("TTL", "k");
+        assertTrue(ttlReply.startsWith(":"), ttlReply);
+        int seconds = Integer.parseInt(ttlReply.substring(1, ttlReply.indexOf("\r")));
+        assertTrue(seconds > 0, "TTL should be positive, got " + seconds);
+    }
+
+    @Test
+    void setWithPxSetsMillisTtl() throws IOException {
+        assertEquals("+OK\r\n", run("SET", "k", "v", "PX", "60000"));
+        String reply = run("PTTL", "k");
+        assertTrue(reply.startsWith(":"), reply);
+        long ms = Long.parseLong(reply.substring(1, reply.indexOf("\r")));
+        assertTrue(ms > 0, "PTTL should be positive, got " + ms);
+    }
+
+    @Test
+    void expireCommandWorks() throws IOException {
+        run("SET", "k", "v");
+        assertEquals(":1\r\n", run("EXPIRE", "k", "60"));
+        assertEquals(":0\r\n", run("EXPIRE", "missing", "60"));
+    }
+
+    @Test
+    void persistCommandWorks() throws IOException {
+        run("SET", "k", "v", "EX", "60");
+        assertEquals(":1\r\n", run("PERSIST", "k"));
+        assertEquals(":-1\r\n", run("TTL", "k"));
+    }
+
+    @Test
+    void ttlReturnsMinusTwoForMissing() throws IOException {
+        assertEquals(":-2\r\n", run("TTL", "nope"));
+    }
+
+    @Test
+    void ttlReturnsMinusOneForKeyWithoutExpiry() throws IOException {
+        run("SET", "k", "v");
+        assertEquals(":-1\r\n", run("TTL", "k"));
+    }
+
+    @Test
+    void pexpireCommandWorks() throws IOException {
+        run("SET", "k", "v");
+        assertEquals(":1\r\n", run("PEXPIRE", "k", "60000"));
+        String reply = run("PTTL", "k");
+        assertTrue(reply.startsWith(":"), reply);
+        long ms = Long.parseLong(reply.substring(1, reply.indexOf("\r")));
+        assertTrue(ms > 0, "PTTL should be positive after PEXPIRE");
+    }
+
+    @Test
+    void setWithInvalidExOptionErrors() throws IOException {
+        String result = run("SET", "k", "v", "EX", "notanumber");
+        assertTrue(result.startsWith("-ERR"), result);
+    }
+
+    @Test
+    void setWithUnknownOptionErrors() throws IOException {
+        String result = run("SET", "k", "v", "XX");
+        assertTrue(result.startsWith("-ERR"), result);
+    }
 }

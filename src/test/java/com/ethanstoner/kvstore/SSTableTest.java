@@ -21,9 +21,9 @@ class SSTableTest {
         );
         SSTable.write(file, entries);
         try (SSTable sst = SSTable.open(file)) {
-            assertEquals(Optional.of("red"), sst.get("apple"));
-            assertEquals(Optional.of("yellow"), sst.get("banana"));
-            assertEquals(Optional.of("dark red"), sst.get("cherry"));
+            assertEquals("red",      sst.get("apple").map(ValueEntry::value).orElse(null));
+            assertEquals("yellow",   sst.get("banana").map(ValueEntry::value).orElse(null));
+            assertEquals("dark red", sst.get("cherry").map(ValueEntry::value).orElse(null));
             assertTrue(sst.get("dragonfruit").isEmpty());
         }
     }
@@ -37,9 +37,9 @@ class SSTableTest {
         );
         SSTable.write(file, entries);
         try (SSTable sst = SSTable.open(file)) {
-            assertEquals(Optional.of("yes"), sst.get("alive"));
+            assertEquals("yes", sst.get("alive").map(ValueEntry::value).orElse(null));
             assertTrue(sst.get("dead").isPresent());
-            assertEquals(Memtable.TOMBSTONE, sst.get("dead").get());
+            assertEquals(Memtable.TOMBSTONE, sst.get("dead").get().value());
         }
     }
 
@@ -54,10 +54,10 @@ class SSTableTest {
         );
         SSTable.write(file, entries);
         try (SSTable sst = SSTable.open(file)) {
-            NavigableMap<String, String> range = sst.scan("b", "d");
+            NavigableMap<String, ValueEntry> range = sst.scan("b", "d");
             assertEquals(List.of("b", "c"), new ArrayList<>(range.keySet()));
-            assertEquals("2", range.get("b"));
-            assertEquals("3", range.get("c"));
+            assertEquals("2", range.get("b").value());
+            assertEquals("3", range.get("c").value());
         }
     }
 
@@ -135,6 +135,7 @@ class SSTableTest {
                         for (int j = 0; j < 50; j++) {
                             int i = r.nextInt(1000);
                             String got = sst.get(String.format("k%05d", i))
+                                            .map(ValueEntry::value)
                                             .orElseThrow();
                             if (!("value-" + i).equals(got)) {
                                 throw new AssertionError("wrong value: " + got);

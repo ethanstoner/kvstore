@@ -33,6 +33,11 @@ import java.util.concurrent.locks.ReentrantLock;
  *   get(k)   ─► active memtable  ─► immutable memtable  ─► SSTables (newest→oldest)
  * </pre>
  *
+ * <h2>TTL / expiration</h2>
+ * <p>Each entry carries an optional absolute expiration timestamp (epoch ms).
+ * Expired entries are invisible to reads and dropped during compaction.
+ * The expiry is durable: it is stored in the WAL and in the SSTable.
+ *
  * <h2>Concurrent flush</h2>
  * <p>When a flush is triggered the active memtable moves to an
  * {@link #immutableMemtable} slot and is written to an SSTable on a single
@@ -175,16 +180,12 @@ public final class KvStore implements AutoCloseable {
         this.immutableMemtable = null;
 
         // Replay wal-pending.log first (older data — was being flushed at crash).
-        // We leave it on disk; it will be deleted when the next flush completes
-        // and clobbers it via REPLACE_EXISTING (see triggerFlush) then the
-        // background task deletes it.  This is safe: if we crash again before
-        // any flush, both WALs are replayed again on the next restart.
         Path pendingWalPath = dataDir.resolve(WAL_PENDING_NAME);
         if (Files.exists(pendingWalPath)) {
             try (WriteAheadLog pendingWal = new WriteAheadLog(pendingWalPath)) {
-                pendingWal.replay((key, value) -> {
+                pendingWal.replay((key, value, expiresAtMs) -> {
                     if (value == null) memtable.delete(key);
-                    else              memtable.put(key, value);
+                    else              memtable.put(key, value, expiresAtMs);
                 });
             }
         }
@@ -192,9 +193,9 @@ public final class KvStore implements AutoCloseable {
         // Replay active WAL (newer data — normal writes since last flush).
         Path walPath = dataDir.resolve(WAL_NAME);
         this.wal = new WriteAheadLog(walPath);
-        wal.replay((key, value) -> {
+        wal.replay((key, value, expiresAtMs) -> {
             if (value == null) memtable.delete(key);
-            else               memtable.put(key, value);
+            else               memtable.put(key, value, expiresAtMs);
         });
 
         startCompactionThread();
@@ -205,13 +206,15 @@ public final class KvStore implements AutoCloseable {
     // =========================================================================
 
     public void put(String key, String value) throws IOException {
+        put(key, value, ValueEntry.NEVER);
+    }
+
+    public void put(String key, String value, long expiresAtMs) throws IOException {
         flushLock.lock();
         try {
-            // Block if the single immutable slot is occupied.
             waitForFlushSlot();
-
-            wal.appendPut(key, value);   // durable first
-            memtable.put(key, value);    // then visible
+            wal.appendPut(key, value, expiresAtMs);   // durable first
+            memtable.put(key, value, expiresAtMs);    // then visible
             triggerFlushIfNeeded();
         } finally {
             flushLock.unlock();
@@ -222,13 +225,71 @@ public final class KvStore implements AutoCloseable {
         flushLock.lock();
         try {
             waitForFlushSlot();
-
             wal.appendDelete(key);
             memtable.delete(key);
             triggerFlushIfNeeded();
         } finally {
             flushLock.unlock();
         }
+    }
+
+    /**
+     * Sets an expiry on an existing key. Returns {@code true} if the key existed
+     * (and the expiry was set), {@code false} if the key is missing or expired.
+     */
+    public boolean expire(String key, long expiresAtMs) throws IOException {
+        flushLock.lock();
+        try {
+            Optional<ValueEntry> existing = getEntry(key);
+            if (existing.isEmpty() || Memtable.TOMBSTONE.equals(existing.get().value())) {
+                return false;
+            }
+            String value = existing.get().value();
+            wal.appendPut(key, value, expiresAtMs);
+            memtable.put(key, value, expiresAtMs);
+            triggerFlushIfNeeded();
+            return true;
+        } finally {
+            flushLock.unlock();
+        }
+    }
+
+    /**
+     * Removes the TTL from an existing key. Returns {@code true} if the key had
+     * a TTL that was removed, {@code false} if the key is missing, expired, or
+     * had no TTL.
+     */
+    public boolean persist(String key) throws IOException {
+        flushLock.lock();
+        try {
+            Optional<ValueEntry> existing = getEntry(key);
+            if (existing.isEmpty() || Memtable.TOMBSTONE.equals(existing.get().value())) {
+                return false;
+            }
+            ValueEntry e = existing.get();
+            if (!e.hasTtl()) {
+                return false;
+            }
+            String value = e.value();
+            wal.appendPut(key, value, ValueEntry.NEVER);
+            memtable.put(key, value, ValueEntry.NEVER);
+            triggerFlushIfNeeded();
+            return true;
+        } finally {
+            flushLock.unlock();
+        }
+    }
+
+    /**
+     * Returns the remaining TTL in milliseconds, {@code -1} if the key has no
+     * TTL, or {@code -2} if the key is missing or expired.
+     */
+    public long ttl(String key) throws IOException {
+        Optional<ValueEntry> e = getEntry(key);
+        if (e.isEmpty()) return -2;
+        long expiresAt = e.get().expiresAtMs();
+        if (expiresAt == ValueEntry.NEVER) return -1;
+        return Math.max(0, expiresAt - System.currentTimeMillis());
     }
 
     /**
@@ -258,10 +319,13 @@ public final class KvStore implements AutoCloseable {
             }
             long updated = Math.addExact(current, delta);  // throws on overflow
 
-            // Write the new value
+            // Write the new value (preserve existing TTL if any)
             String newValue = Long.toString(updated);
-            wal.appendPut(key, newValue);
-            memtable.put(key, newValue);
+            // Check if existing key has TTL to preserve
+            Optional<ValueEntry> existingEntry = getEntry(key);
+            long expiresAtMs = existingEntry.isPresent() ? existingEntry.get().expiresAtMs() : ValueEntry.NEVER;
+            wal.appendPut(key, newValue, expiresAtMs);
+            memtable.put(key, newValue, expiresAtMs);
             triggerFlushIfNeeded();
             return updated;
         } finally {
@@ -300,36 +364,59 @@ public final class KvStore implements AutoCloseable {
      * Point lookup. Checks the memtable first, then the immutable memtable (if
      * a flush is in progress), then SSTables newest-to-oldest.
      *
+     * <p>Expired entries are treated as absent.
+     *
      * <p>Intentionally lock-free: takes a snapshot of each volatile field once.
      *
-     * @return the value, or {@code Optional.empty()} if absent / deleted
+     * @return the value, or {@code Optional.empty()} if absent / deleted / expired
      */
     public Optional<String> get(String key) throws IOException {
+        Optional<ValueEntry> entry = getEntry(key);
+        if (entry.isEmpty() || Memtable.TOMBSTONE.equals(entry.get().value())) {
+            return Optional.empty();
+        }
+        return Optional.of(entry.get().value());
+    }
+
+    /**
+     * Internal point lookup returning the full {@link ValueEntry} (value + expiry).
+     * Filters out expired entries. Returns {@code Optional.empty()} for missing,
+     * deleted, or expired keys.
+     */
+    private Optional<ValueEntry> getEntry(String key) throws IOException {
+        long now = System.currentTimeMillis();
+
         // Snapshot all volatile references once; no lock needed.
         Memtable active    = memtable;
         Memtable immutable = immutableMemtable;
         List<SSTable> tables = sstables;
 
         // 1. Active memtable (most recent writes).
-        String v = active.get(key);
-        if (v != null) {
-            return Memtable.TOMBSTONE.equals(v) ? Optional.empty() : Optional.of(v);
+        ValueEntry e = active.getEntry(key);
+        if (e != null) {
+            if (Memtable.TOMBSTONE.equals(e.value())) return Optional.empty();
+            if (e.isExpired(now)) return Optional.empty();
+            return Optional.of(e);
         }
 
         // 2. Immutable memtable (in RAM, slightly older — being flushed right now).
         if (immutable != null) {
-            v = immutable.get(key);
-            if (v != null) {
-                return Memtable.TOMBSTONE.equals(v) ? Optional.empty() : Optional.of(v);
+            e = immutable.getEntry(key);
+            if (e != null) {
+                if (Memtable.TOMBSTONE.equals(e.value())) return Optional.empty();
+                if (e.isExpired(now)) return Optional.empty();
+                return Optional.of(e);
             }
         }
 
         // 3. SSTables newest-to-oldest.
         for (int i = tables.size() - 1; i >= 0; i--) {
-            Optional<String> found = tables.get(i).get(key);
+            Optional<ValueEntry> found = tables.get(i).get(key);
             if (found.isPresent()) {
-                String val = found.get();
-                return Memtable.TOMBSTONE.equals(val) ? Optional.empty() : Optional.of(val);
+                ValueEntry entry = found.get();
+                if (Memtable.TOMBSTONE.equals(entry.value())) return Optional.empty();
+                if (entry.isExpired(now)) return Optional.empty();
+                return found;
             }
         }
 
@@ -337,7 +424,8 @@ public final class KvStore implements AutoCloseable {
     }
 
     /**
-     * Ordered range scan, {@code [fromInclusive, toExclusive)}, tombstones hidden.
+     * Ordered range scan, {@code [fromInclusive, toExclusive)}, tombstones and
+     * expired entries hidden.
      *
      * <p>Merges active memtable, immutable memtable (if any), and all SSTables
      * newest-to-oldest; the first writer wins (newest data takes precedence).
@@ -345,23 +433,25 @@ public final class KvStore implements AutoCloseable {
     public Map<String, String> scan(String fromInclusive, String toExclusive)
             throws IOException {
 
+        long now = System.currentTimeMillis();
+
         // Snapshot all volatile references once; no lock needed.
         Memtable active    = memtable;
         Memtable immutable = immutableMemtable;
         List<SSTable> tables = sstables;
 
         // Use TreeMap so result is sorted.
-        TreeMap<String, String> merged = new TreeMap<>();
+        TreeMap<String, ValueEntry> merged = new TreeMap<>();
 
         // 1. Active memtable entries (newest — populate first).
-        for (Map.Entry<String, String> e :
+        for (Map.Entry<String, ValueEntry> e :
                 active.scan(fromInclusive, toExclusive).entrySet()) {
             merged.put(e.getKey(), e.getValue());
         }
 
         // 2. Immutable memtable (if a flush is in progress — older than active).
         if (immutable != null) {
-            for (Map.Entry<String, String> e :
+            for (Map.Entry<String, ValueEntry> e :
                     immutable.scan(fromInclusive, toExclusive).entrySet()) {
                 merged.putIfAbsent(e.getKey(), e.getValue());
             }
@@ -369,16 +459,22 @@ public final class KvStore implements AutoCloseable {
 
         // 3. SSTables newest-to-oldest; putIfAbsent keeps the newest value.
         for (int i = tables.size() - 1; i >= 0; i--) {
-            for (Map.Entry<String, String> e :
+            for (Map.Entry<String, ValueEntry> e :
                     tables.get(i).scan(fromInclusive, toExclusive).entrySet()) {
                 merged.putIfAbsent(e.getKey(), e.getValue());
             }
         }
 
-        // 4. Filter out tombstones.
-        merged.entrySet().removeIf(e -> Memtable.TOMBSTONE.equals(e.getValue()));
+        // 4. Filter out tombstones and expired entries; convert to String values.
+        TreeMap<String, String> result = new TreeMap<>();
+        for (Map.Entry<String, ValueEntry> e : merged.entrySet()) {
+            ValueEntry ve = e.getValue();
+            if (Memtable.TOMBSTONE.equals(ve.value())) continue;
+            if (ve.isExpired(now)) continue;
+            result.put(e.getKey(), ve.value());
+        }
 
-        return merged;
+        return result;
     }
 
     // =========================================================================
@@ -418,12 +514,7 @@ public final class KvStore implements AutoCloseable {
         Memtable snapshot = memtable;
         immutableMemtable = snapshot;
 
-        // Rotate WAL:
-        //   close the current wal.log,
-        //   rename it to wal-pending.log (overwriting any previous one — safe,
-        //   because the previous pending data already lives in the memtable we
-        //   just snapshotted above, which will end up in the new SSTable),
-        //   open a fresh wal.log for new writes.
+        // Rotate WAL.
         wal.close();
         Files.move(
                 dataDir.resolve(WAL_NAME),
@@ -435,11 +526,10 @@ public final class KvStore implements AutoCloseable {
         // Open fresh memtable for incoming writes.
         memtable = new Memtable();
 
-        // Capture sequence number for this flush; increment so the next flush
-        // (or compaction) gets a different number.
+        // Capture sequence number for this flush.
         final int flushSeq = nextSequence++;
 
-        // Submit the I/O work to the background thread (does not hold flushLock).
+        // Submit the I/O work to the background thread.
         flushExecutor.submit(() -> doBackgroundFlush(snapshot, flushSeq));
     }
 
@@ -452,7 +542,7 @@ public final class KvStore implements AutoCloseable {
         try {
             // Flush outputs always go to L0.
             Path sstPath = SSTable.fileName(dataDir, 0, seq);
-            SSTable.write(sstPath, immutable.entries());
+            SSTable.write(sstPath, immutable.entries().entrySet());
             SSTable newSst = SSTable.open(sstPath);
             newSst.attachCache(blockCache);
 
@@ -460,13 +550,10 @@ public final class KvStore implements AutoCloseable {
             try {
                 List<SSTable> updated = new ArrayList<>(sstables);
                 updated.add(newSst);
-                // Keep oldest-first order (seq is always ≥ all existing seqs).
                 sstables = Collections.unmodifiableList(updated);
 
-                // The pending WAL's data is now durable in the SSTable.
                 Files.deleteIfExists(dataDir.resolve(WAL_PENDING_NAME));
 
-                // Clear the immutable slot and wake any blocked writers.
                 immutableMemtable = null;
                 pendingFlushDone.signalAll();
             } finally {
@@ -474,9 +561,6 @@ public final class KvStore implements AutoCloseable {
             }
 
         } catch (IOException e) {
-            // Log the failure but do NOT clear immutableMemtable.
-            // Writers will block in waitForFlushSlot, which is intentional —
-            // we must not acknowledge writes we cannot make durable.
             System.err.println("[kvstore-flush] background flush failed (seq=" + seq + "): " + e);
         }
     }
@@ -504,10 +588,6 @@ public final class KvStore implements AutoCloseable {
 
     /**
      * Triggers compaction immediately (used in tests and for manual compaction).
-     *
-     * <p>Does NOT wait for any in-progress background flush to complete.  If you
-     * need to ensure all flushes are done before compacting, close and reopen
-     * the store, or wait for {@link #close()} to drain pending work.
      */
     public void compactNow() throws IOException {
         runCompaction();
@@ -526,13 +606,6 @@ public final class KvStore implements AutoCloseable {
 
     /**
      * LevelDB-style leveled compaction.
-     *
-     * <ul>
-     *   <li>L0: capped at {@link #L0_TRIGGER_FILES} files (they may overlap).</li>
-     *   <li>L1+: capped at {@link #sizeLimitForLevel} bytes; each level is
-     *       {@link #LEVEL_SIZE_MULTIPLIER}× larger than the previous.</li>
-     *   <li>Within a level (L1+), SSTables have non-overlapping key ranges.</li>
-     * </ul>
      */
     private void runCompaction() throws IOException {
         List<SSTable> snapshot = sstables;
@@ -548,7 +621,6 @@ public final class KvStore implements AutoCloseable {
         }
 
         // ── Pick a level to compact ───────────────────────────────────────────
-        // Priority: L0 if it has ≥ L0_TRIGGER_FILES, else deepest over-size level.
         int compactLevel = -1;
         if (byLevel.getOrDefault(0, List.of()).size() >= L0_TRIGGER_FILES) {
             compactLevel = 0;
@@ -577,7 +649,6 @@ public final class KvStore implements AutoCloseable {
 
         String inputMinKey, inputMaxKey;
         if (compactLevel == 0) {
-            // All of L0 (files may overlap each other; compact them all together).
             inputs.addAll(currentLevel);
             if (inputs.isEmpty()) return;
             inputMinKey = inputs.stream()
@@ -589,7 +660,6 @@ public final class KvStore implements AutoCloseable {
                     .map(s -> s.keySet().last())
                     .max(Comparator.naturalOrder()).orElse(null);
         } else {
-            // Pick the oldest SSTable from this level.
             SSTable picked = currentLevel.get(0);
             NavigableSet<String> keys = picked.keySet();
             if (keys.isEmpty()) return;
@@ -605,15 +675,12 @@ public final class KvStore implements AutoCloseable {
             if (keys.isEmpty()) continue;
             String smin = keys.first();
             String smax = keys.last();
-            // Overlap if NOT (smax < inputMin OR smin > inputMax)
             if (!(smax.compareTo(inputMinKey) < 0 || smin.compareTo(inputMaxKey) > 0)) {
                 inputs.add(s);
             }
         }
 
         // ── Tombstone-drop safety ─────────────────────────────────────────────
-        // Only drop tombstones if nothing exists below outputLevel that could
-        // still hold a shadowed value for the key range being compacted.
         boolean canDropTombstones = true;
         for (int lvl = outputLevel + 1; lvl <= maxLevel; lvl++) {
             if (!byLevel.getOrDefault(lvl, List.of()).isEmpty()) {
@@ -623,29 +690,33 @@ public final class KvStore implements AutoCloseable {
         }
 
         // ── K-way merge (newest sequence wins per key) ────────────────────────
-        TreeMap<String, String> merged = new TreeMap<>();
+        long now = System.currentTimeMillis();
+        TreeMap<String, ValueEntry> merged = new TreeMap<>();
         List<SSTable> sortedByAge = new ArrayList<>(inputs);
         sortedByAge.sort(Comparator.comparingInt(SSTable::sequenceNum).reversed());
         for (SSTable s : sortedByAge) {
             NavigableSet<String> keys = s.keySet();
             if (keys.isEmpty()) continue;
-            NavigableMap<String, String> all = s.scan(keys.first(), keys.last() + "\0");
-            for (Map.Entry<String, String> e : all.entrySet()) {
+            NavigableMap<String, ValueEntry> all = s.scan(keys.first(), keys.last() + "\0");
+            for (Map.Entry<String, ValueEntry> e : all.entrySet()) {
                 merged.putIfAbsent(e.getKey(), e.getValue());
             }
         }
 
         if (canDropTombstones) {
-            merged.values().removeIf(v -> Memtable.TOMBSTONE.equals(v));
+            // Drop tombstones and expired entries when it's safe to do so.
+            merged.entrySet().removeIf(e ->
+                    Memtable.TOMBSTONE.equals(e.getValue().value())
+                    || e.getValue().isExpired(now));
         }
 
         // ── Split output into bounded-size SSTables ───────────────────────────
-        List<List<Map.Entry<String, String>>> chunks = new ArrayList<>();
-        List<Map.Entry<String, String>> chunk = new ArrayList<>();
+        List<List<Map.Entry<String, ValueEntry>>> chunks = new ArrayList<>();
+        List<Map.Entry<String, ValueEntry>> chunk = new ArrayList<>();
         long chunkBytes = 0L;
-        for (Map.Entry<String, String> e : merged.entrySet()) {
+        for (Map.Entry<String, ValueEntry> e : merged.entrySet()) {
             chunk.add(e);
-            chunkBytes += e.getKey().length() + e.getValue().length() + 10;
+            chunkBytes += e.getKey().length() + e.getValue().value().length() + 18; // +8 for expiry long
             if (chunkBytes >= TARGET_SSTABLE_BYTES) {
                 chunks.add(chunk);
                 chunk = new ArrayList<>();
@@ -659,7 +730,7 @@ public final class KvStore implements AutoCloseable {
         flushLock.lock();
         try {
             firstSeq = nextSequence;
-            nextSequence += Math.max(1, chunks.size()); // reserve at least 1
+            nextSequence += Math.max(1, chunks.size());
         } finally {
             flushLock.unlock();
         }
@@ -669,8 +740,7 @@ public final class KvStore implements AutoCloseable {
         List<Path>    newPaths    = new ArrayList<>();
         try {
             if (chunks.isEmpty()) {
-                // All entries were tombstones and got dropped — nothing to write.
-                // Fall through to the atomic-swap section which will just delete inputs.
+                // All entries were tombstones/expired and got dropped — nothing to write.
             } else {
                 for (int i = 0; i < chunks.size(); i++) {
                     Path outPath = SSTable.fileName(dataDir, outputLevel, firstSeq + i);
@@ -682,7 +752,6 @@ public final class KvStore implements AutoCloseable {
                 }
             }
         } catch (IOException e) {
-            // Roll back any partial writes before re-throwing.
             for (SSTable s : newSstables) {
                 try { s.close(); } catch (IOException ignored) {}
             }
@@ -732,25 +801,15 @@ public final class KvStore implements AutoCloseable {
 
     /**
      * Closes the store cleanly.
-     *
-     * <ol>
-     *   <li>Stops the compaction thread.</li>
-     *   <li>Waits for any in-progress background flush to finish
-     *       (so no data is lost from the immutable memtable).</li>
-     *   <li>Shuts down the flush executor.</li>
-     *   <li>Closes the WAL and all SSTables.</li>
-     * </ol>
      */
     @Override
     public void close() throws IOException {
-        // Stop the compaction thread first (it may be holding or wanting flushLock).
         if (compactionThread != null) {
             compactionThread.interrupt();
         }
 
         flushLock.lock();
         try {
-            // Drain any in-progress background flush.
             while (immutableMemtable != null) {
                 try {
                     pendingFlushDone.await();
@@ -760,7 +819,6 @@ public final class KvStore implements AutoCloseable {
                 }
             }
 
-            // Shut down the executor (background task has finished or we broke out).
             flushExecutor.shutdown();
             try {
                 flushExecutor.awaitTermination(5, TimeUnit.SECONDS);
