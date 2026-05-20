@@ -70,4 +70,32 @@ class KvStoreTest {
             assertTrue(reopened.get("temp").isEmpty()); // delete survived too
         }
     }
+
+    @Test
+    void flushWritesSStableWhenMemtableExceedsThreshold(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            String bigValue = "x".repeat(100);
+            for (int i = 0; i < 20_000; i++) {
+                store.put("key-" + String.format("%06d", i), bigValue);
+            }
+            long sstCount = java.nio.file.Files.list(dir)
+                    .filter(p -> p.getFileName().toString().endsWith(".db"))
+                    .count();
+            assertTrue(sstCount >= 1, "Expected at least 1 SSTable, found " + sstCount);
+        }
+    }
+
+    @Test
+    void dataSurvivesFlushAndReopen(@TempDir Path dir) throws IOException {
+        try (KvStore store = new KvStore(dir)) {
+            String bigValue = "x".repeat(100);
+            for (int i = 0; i < 20_000; i++) {
+                store.put("key-" + String.format("%06d", i), bigValue);
+            }
+        }
+        try (KvStore reopened = new KvStore(dir)) {
+            assertEquals(Optional.of("x".repeat(100)), reopened.get("key-000000"));
+            assertEquals(Optional.of("x".repeat(100)), reopened.get("key-019999"));
+        }
+    }
 }
