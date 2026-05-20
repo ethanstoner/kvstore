@@ -62,28 +62,30 @@ The huge gap between existing and missing key reads is the bloom filter: when it
 ## Architecture
 
 ```
-  redis-cli · redis-py · Jedis · any RESP client
-                       │  TCP (optional TLSv1.3), RESP protocol
-                       ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │  Network layer                                            │
-  │  accept loop ──► vthread per connection ──► RESP I/O      │
-  │                                            │              │
-  │                                            ▼              │
-  │                                  AUTH ──► command dispatch│
-  │                                  (multi-user, per-user ACL)│
-  └────────────────────┬──────────────────────────────────────┘
-                       │  put / get / delete / scan
-                       ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │  Storage engine  (LSM-tree)                               │
-  │                                                           │
-  │   WAL ──► Memtable ──► Immutable ──► SSTables             │
-  │  (CRC32) (skip-list)   memtable    (L0 ─► L1 ─► L2 …)     │
-  │                                                           │
-  │  Background:  concurrent flush, leveled compaction        │
-  │  Shared:      LRU block cache, bloom filter per file      │
-  └───────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────┐
+  │  Clients     redis-cli · redis-py · Jedis · any RESP lib   │
+  └──────────────────────────────┬─────────────────────────────┘
+                                 │   TCP (optional TLSv1.3)
+                                 ▼
+  ┌────────────────────────────────────────────────────────────┐
+  │  Network layer                                             │
+  │                                                            │
+  │     accept loop  ──►  one vthread per connection           │
+  │                                  │                         │
+  │                                  ▼                         │
+  │     RESP parser  ──►  AUTH + ACL  ──►  command dispatch    │
+  └──────────────────────────────┬─────────────────────────────┘
+                                 │   put / get / delete / scan
+                                 ▼
+  ┌────────────────────────────────────────────────────────────┐
+  │  Storage engine  (LSM-tree)                                │
+  │                                                            │
+  │     WAL  ──►  Memtable  ──►  Immutable  ──►  SSTables      │
+  │    (CRC32) (skip-list)    memtable      (L0 → L1 → L2 …)   │
+  │                                                            │
+  │     Background:   concurrent flush, leveled compaction     │
+  │     Shared:       LRU block cache, bloom filter per file   │
+  └────────────────────────────────────────────────────────────┘
 ```
 
 Every write is logged to disk before it is applied in memory; that ordering is what makes a crash survivable. When the memtable exceeds 4 MB it is atomically swapped to an immutable slot and a background thread writes it to an L0 SSTable. New writes continue against a fresh memtable without blocking. A separate background thread compacts L_n into L_n+1, dropping tombstones only when they reach the deepest level.
