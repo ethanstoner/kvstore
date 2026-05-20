@@ -354,4 +354,48 @@ class CommandHandlerTest {
             assertFalse(unauth.authed);
         }
     }
+
+    // ── INCR / DECR / INCRBY / DECRBY tests ────────────────────────────────
+
+    @Test
+    void incrCreatesAndIncrements() throws IOException {
+        assertEquals(":1\r\n", run("INCR", "counter"));
+        assertEquals(":2\r\n", run("INCR", "counter"));
+        assertEquals(":3\r\n", run("INCR", "counter"));
+    }
+
+    @Test
+    void decrCreatesAndDecrements() throws IOException {
+        assertEquals(":-1\r\n", run("DECR", "counter"));
+        assertEquals(":-2\r\n", run("DECR", "counter"));
+    }
+
+    @Test
+    void incrbyAndDecrbyWorkWithExplicitDelta() throws IOException {
+        assertEquals(":10\r\n", run("INCRBY", "x", "10"));
+        assertEquals(":25\r\n", run("INCRBY", "x", "15"));
+        assertEquals(":20\r\n", run("DECRBY", "x", "5"));
+    }
+
+    @Test
+    void incrOnNonIntegerErrors() throws IOException {
+        run("SET", "name", "alice");
+        String result = run("INCR", "name");
+        assertTrue(result.startsWith("-ERR"), result);
+        assertTrue(result.contains("integer"), result);
+    }
+
+    @Test
+    void incrbyWithNonIntegerDeltaErrors() throws IOException {
+        String result = run("INCRBY", "x", "notanumber");
+        assertTrue(result.startsWith("-ERR"), result);
+    }
+
+    @Test
+    void incrArityErrors() throws IOException {
+        String r1 = run("INCR");
+        assertTrue(r1.startsWith("-ERR"), r1);
+        String r2 = run("INCRBY", "x");
+        assertTrue(r2.startsWith("-ERR"), r2);
+    }
 }
