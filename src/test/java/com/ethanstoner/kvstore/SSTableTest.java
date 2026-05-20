@@ -101,4 +101,56 @@ class SSTableTest {
             assertEquals(3, sst.entryCount());
         }
     }
+
+    /**
+     * Verifies that many virtual threads can read from the same SSTable
+     * concurrently without deadlock, data corruption, or incorrect results.
+     *
+     * <p>This test exercises the {@code FileChannel} positional-read path,
+     * which must be safe for concurrent access without any synchronization.
+     */
+    @Test
+    void concurrentReadsFromManyVirtualThreads(@TempDir Path dir) throws Exception {
+        // Build an SSTable with many entries
+        Path file = dir.resolve("L0-000001.db");
+        List<Map.Entry<String, String>> entries = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) {
+            entries.add(Map.entry(String.format("k%05d", i), "value-" + i));
+        }
+        SSTable.write(file, entries);
+
+        try (SSTable sst = SSTable.open(file)) {
+            int n = 100;
+            java.util.concurrent.CountDownLatch done =
+                    new java.util.concurrent.CountDownLatch(n);
+            List<Throwable> errors =
+                    Collections.synchronizedList(new ArrayList<>());
+
+            // Many vthreads doing concurrent reads — must not deadlock and must
+            // return correct values with no locking on the channel.
+            for (int t = 0; t < n; t++) {
+                Thread.startVirtualThread(() -> {
+                    try {
+                        java.util.Random r = new java.util.Random();
+                        for (int j = 0; j < 50; j++) {
+                            int i = r.nextInt(1000);
+                            String got = sst.get(String.format("k%05d", i))
+                                            .orElseThrow();
+                            if (!("value-" + i).equals(got)) {
+                                throw new AssertionError("wrong value: " + got);
+                            }
+                        }
+                    } catch (Throwable th) {
+                        errors.add(th);
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+
+            assertTrue(done.await(30, java.util.concurrent.TimeUnit.SECONDS),
+                    "Timed out waiting for virtual threads");
+            assertTrue(errors.isEmpty(), "Errors during concurrent reads: " + errors);
+        }
+    }
 }

@@ -1,9 +1,12 @@
 package com.ethanstoner.kvstore;
 
 import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -33,6 +36,11 @@ import java.util.regex.Pattern;
  *   entryCount:  4 bytes
  *   magic:       4 bytes  (0x4B565354 = "KVST")
  * </pre>
+ *
+ * <p>Reads use {@link FileChannel#read(ByteBuffer, long)} which is a
+ * stateless positional read. Multiple virtual threads can call it
+ * concurrently on the same channel without any locking, eliminating
+ * carrier-thread pinning under high-concurrency workloads.
  */
 public final class SSTable implements AutoCloseable {
 
@@ -57,7 +65,7 @@ public final class SSTable implements AutoCloseable {
     // -------------------------------------------------------------------------
 
     private final Path                    filePath;
-    private final RandomAccessFile        raf;
+    private final FileChannel             channel;
     private final BloomFilter             bloom;
     private final TreeMap<String, Long>   index;   // key -> absolute data offset
     private final int                     entryCount;
@@ -71,12 +79,12 @@ public final class SSTable implements AutoCloseable {
     // -------------------------------------------------------------------------
 
     private SSTable(Path filePath,
-                    RandomAccessFile raf,
+                    FileChannel channel,
                     BloomFilter bloom,
                     TreeMap<String, Long> index,
                     int entryCount) {
         this.filePath   = filePath;
-        this.raf        = raf;
+        this.channel    = channel;
         this.bloom      = bloom;
         this.index      = index;
         this.entryCount = entryCount;
@@ -211,27 +219,31 @@ public final class SSTable implements AutoCloseable {
      * Opens an existing SSTable for reading.
      *
      * <p>Reads the footer to locate and load the bloom filter and the index.
-     * The data section is accessed lazily via random seeks.
+     * The data section is accessed lazily via stateless positional reads on
+     * a {@link FileChannel}, which is safe for concurrent virtual-thread access
+     * without any locking.
      *
      * @param file path to an existing SSTable file
      * @return an open {@link SSTable} (caller must close it)
      * @throws IOException if the file cannot be read or its magic is wrong
      */
     public static SSTable open(Path file) throws IOException {
-        long fileSize = Files.size(file);
-        if (fileSize < FOOTER_BYTES) {
-            throw new IOException(
-                    "File too small to be a valid SSTable: " + file);
-        }
-
-        RandomAccessFile raf = new RandomAccessFile(file.toFile(), "r");
+        FileChannel channel = FileChannel.open(file, StandardOpenOption.READ);
         try {
+            long fileSize = channel.size();
+            if (fileSize < FOOTER_BYTES) {
+                throw new IOException(
+                        "File too small to be a valid SSTable: " + file);
+            }
+
             // --- Read footer ----------------------------------------------------
-            raf.seek(fileSize - FOOTER_BYTES);
-            long bloomOffset = raf.readLong();
-            long indexOffset = raf.readLong();
-            int  count       = raf.readInt();
-            int  magic       = raf.readInt();
+            ByteBuffer footer = ByteBuffer.allocate(FOOTER_BYTES);
+            readFully(channel, footer, fileSize - FOOTER_BYTES);
+            footer.flip();
+            long bloomOffset = footer.getLong();
+            long indexOffset = footer.getLong();
+            int  count       = footer.getInt();
+            int  magic       = footer.getInt();
 
             if (magic != MAGIC) {
                 throw new IOException(
@@ -247,33 +259,48 @@ public final class SSTable implements AutoCloseable {
             }
 
             // --- Read bloom filter ----------------------------------------------
-            raf.seek(bloomOffset);
             int bloomLen = (int)(indexOffset - bloomOffset);
-            byte[] bloomBytes = new byte[bloomLen];
-            raf.readFully(bloomBytes);
+            ByteBuffer bloomBuf = ByteBuffer.allocate(bloomLen);
+            readFully(channel, bloomBuf, bloomOffset);
             BloomFilter bf;
             try (DataInputStream dis = new DataInputStream(
-                    new ByteArrayInputStream(bloomBytes))) {
+                    new ByteArrayInputStream(bloomBuf.array()))) {
                 bf = BloomFilter.readFrom(dis);
             }
 
             // --- Read index -----------------------------------------------------
-            raf.seek(indexOffset);
             long indexEnd = fileSize - FOOTER_BYTES;
+            long pos = indexOffset;
             TreeMap<String, Long> idx = new TreeMap<>();
-            while (raf.getFilePointer() < indexEnd) {
-                int    kLen   = raf.readUnsignedShort();
-                byte[] kBytes = new byte[kLen];
-                raf.readFully(kBytes);
-                long   offset = raf.readLong();
-                idx.put(new String(kBytes, StandardCharsets.UTF_8), offset);
+            while (pos < indexEnd) {
+                // Read keyLen (2 bytes)
+                ByteBuffer hdr = ByteBuffer.allocate(2);
+                readFully(channel, hdr, pos);
+                hdr.flip();
+                int kLen = Short.toUnsignedInt(hdr.getShort());
+                pos += 2;
+
+                // Read key bytes
+                ByteBuffer kBuf = ByteBuffer.allocate(kLen);
+                readFully(channel, kBuf, pos);
+                pos += kLen;
+                String key = new String(kBuf.array(), StandardCharsets.UTF_8);
+
+                // Read offset (8 bytes)
+                ByteBuffer offBuf = ByteBuffer.allocate(8);
+                readFully(channel, offBuf, pos);
+                offBuf.flip();
+                long entryOff = offBuf.getLong();
+                pos += 8;
+
+                idx.put(key, entryOff);
             }
 
-            return new SSTable(file, raf, bf, idx, count);
+            return new SSTable(file, channel, bf, idx, count);
 
         } catch (IOException e) {
-            // Close the RAF if construction fails.
-            try { raf.close(); } catch (IOException ignored) {}
+            // Close the channel if construction fails.
+            try { channel.close(); } catch (IOException ignored) {}
             throw e;
         }
     }
@@ -441,12 +468,33 @@ public final class SSTable implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        raf.close();
+        channel.close();
     }
 
     // =========================================================================
     // Private helpers
     // =========================================================================
+
+    /**
+     * Reads exactly {@code buf.remaining()} bytes from {@code ch} starting at
+     * absolute file position {@code position}, advancing {@code position} as
+     * bytes are consumed.
+     *
+     * <p>{@link FileChannel#read(ByteBuffer, long)} may return fewer bytes than
+     * requested in a single call (short read), so we loop until the buffer is
+     * full.
+     *
+     * @throws EOFException if end-of-file is reached before the buffer is full
+     */
+    private static void readFully(FileChannel ch, ByteBuffer buf, long position)
+            throws IOException {
+        long pos = position;
+        while (buf.hasRemaining()) {
+            int n = ch.read(buf, pos);
+            if (n == -1) throw new EOFException("short read at position " + pos);
+            pos += n;
+        }
+    }
 
     /** Compresses {@code data} with Deflate and returns the compressed bytes. */
     private static byte[] deflate(byte[] data) {
@@ -494,36 +542,58 @@ public final class SSTable implements AutoCloseable {
 
     /**
      * Reads the value (or tombstone sentinel) stored at the given absolute
-     * file offset. Checks the {@link BlockCache} before seeking; populates
-     * the cache on a miss. Synchronized on {@code raf} for thread safety.
+     * file offset. Checks the {@link BlockCache} before reading; populates
+     * the cache on a miss.
+     *
+     * <p>Uses {@link FileChannel#read(ByteBuffer, long)} — a stateless
+     * positional read that does NOT modify the channel's position. Concurrent
+     * calls from many virtual threads proceed without any locking, eliminating
+     * carrier-thread pinning.
      */
     private String readValueAt(long offset) throws IOException {
         if (cache != null) {
             String cached = cache.get(sequenceNum(), offset);
             if (cached != null) return cached;
         }
+
+        // Read op + keyLen header (3 bytes): 1 byte op + 2 bytes keyLen
+        ByteBuffer header = ByteBuffer.allocate(3);
+        readFully(channel, header, offset);
+        header.flip();
+        byte op   = header.get();
+        int  kLen = Short.toUnsignedInt(header.getShort());
+
+        // Skip past the key bytes to reach the value section
+        long pos = offset + 3 + kLen;
+
         String value;
-        synchronized (raf) {
-            raf.seek(offset);
-            byte op = raf.readByte();
-            int kLen = raf.readUnsignedShort();
-            raf.skipBytes(kLen);
-            if (op == OP_TOMBSTONE) {
-                value = Memtable.TOMBSTONE;
+        if (op == OP_TOMBSTONE) {
+            value = Memtable.TOMBSTONE;
+        } else {
+            // Read valueLen (4 bytes)
+            ByteBuffer vLenBuf = ByteBuffer.allocate(4);
+            readFully(channel, vLenBuf, pos);
+            vLenBuf.flip();
+            int vLen = vLenBuf.getInt();
+            pos += 4;
+
+            // Read value bytes
+            ByteBuffer vBuf = ByteBuffer.allocate(vLen);
+            readFully(channel, vBuf, pos);
+            vBuf.flip();
+            byte[] vBytes = new byte[vLen];
+            vBuf.get(vBytes);
+
+            if (op == OP_VALUE_DEFLATE) {
+                byte[] decompressed = inflate(vBytes);
+                value = new String(decompressed, StandardCharsets.UTF_8);
+            } else if (op == OP_VALUE) {
+                value = new String(vBytes, StandardCharsets.UTF_8);
             } else {
-                int vLen = raf.readInt();
-                byte[] vBytes = new byte[vLen];
-                raf.readFully(vBytes);
-                if (op == OP_VALUE_DEFLATE) {
-                    byte[] decompressed = inflate(vBytes);
-                    value = new String(decompressed, StandardCharsets.UTF_8);
-                } else if (op == OP_VALUE) {
-                    value = new String(vBytes, StandardCharsets.UTF_8);
-                } else {
-                    throw new IOException("unknown op byte: " + op);
-                }
+                throw new IOException("unknown op byte: " + op);
             }
         }
+
         if (cache != null) {
             cache.put(sequenceNum(), offset, value);
         }
