@@ -329,6 +329,11 @@ public final class SSTable implements AutoCloseable {
         return Files.size(filePath);
     }
 
+    /** @return the number of entries (including tombstones) stored in this SSTable. */
+    public int entryCount() {
+        return entryCount;
+    }
+
     // =========================================================================
     // Static helpers
     // =========================================================================

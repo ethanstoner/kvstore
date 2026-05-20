@@ -88,4 +88,17 @@ class SSTableTest {
         assertEquals(42, SSTable.sequenceNumber(Path.of("sst-000042.db")));
         assertEquals(999999, SSTable.sequenceNumber(Path.of("sst-999999.db")));
     }
+
+    @Test
+    void entryCountMatchesNumberWritten(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("sst-000001.db");
+        List<Map.Entry<String, String>> entries = List.of(
+                Map.entry("a", "1"),
+                Map.entry("b", "2"),
+                Map.entry("c", "3"));
+        SSTable.write(file, entries);
+        try (SSTable sst = SSTable.open(file)) {
+            assertEquals(3, sst.entryCount());
+        }
+    }
 }
