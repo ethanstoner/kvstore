@@ -74,8 +74,9 @@ Every write is logged to disk **before** it is applied in memory — that orderi
 ## Features
 
 - **Redis wire-protocol compatible** — connect with `redis-cli`, `redis-py`, `Jedis`, or any Redis client library
-- **Password authentication** — `AUTH` command, constant-time comparison, `--requirepass` flag
-- **Virtual-thread server** — Java 21 vthreads, one per connection, scales to thousands of concurrent clients
+- **TLS encryption** — optional `SSLServerSocket` via `--tls-keystore`, TLSv1.3
+- **Multi-user authentication** — Redis 6-style `AUTH <user> <pass>`, multiple users via `--user`, constant-time password comparison
+- **Virtual-thread server** — Java 21 vthreads, one per connection, scales to thousands of concurrent clients. SSTable reads use `FileChannel` positional reads (no carrier pinning)
 - **Durable writes** — write-ahead log with fsync and **CRC32 per record** for corruption detection
 - **SSTable flush** — memtable spills to immutable sorted files when full
 - **Multi-level reads** — get/scan falls through memtable → newest SSTable → older ones
@@ -115,7 +116,9 @@ mvn package                   # build target/kvstore-0.1.0.jar
 java -jar target/kvstore-0.1.0.jar serve                              # port 6379, no auth
 java -jar target/kvstore-0.1.0.jar serve --port 6380                  # different port
 java -jar target/kvstore-0.1.0.jar serve --data /var/kv               # different data dir
-java -jar target/kvstore-0.1.0.jar serve --requirepass topsecret      # require AUTH
+java -jar target/kvstore-0.1.0.jar serve --requirepass topsecret      # single password
+java -jar target/kvstore-0.1.0.jar serve --user alice:s1 --user bob:s2  # multi-user ACL
+java -jar target/kvstore-0.1.0.jar serve --tls-keystore kv.jks --tls-keystore-pass changeit  # TLS
 
 # In another terminal — works with any Redis client:
 redis-cli -p 6379 ping                       # PONG
@@ -126,8 +129,12 @@ redis-cli -p 6379 info                       # server / stats / storage / cache
 redis-cli -p 6379 shutdown                   # graceful stop
 
 # With auth:
-redis-cli -p 6379 -a topsecret get hello     # authenticated
-redis-cli -p 6379 get hello                  # (error) NOAUTH Authentication required.
+redis-cli -p 6379 -a topsecret get hello              # AUTH <password>
+redis-cli -p 6379 --user alice --pass s1 get hello    # AUTH <user> <password>
+redis-cli -p 6379 get hello                           # (error) NOAUTH Authentication required.
+
+# With TLS:
+redis-cli -p 6379 --tls --cacert ca.crt ping          # encrypted handshake
 ```
 
 Supported commands: `AUTH`, `PING`, `SET`, `GET`, `DEL`, `EXISTS`, `MGET`, `MSET`, `SCAN from to` (range scan, not cursor), `DBSIZE`, `INFO`, `COMMAND`, `QUIT`, `SHUTDOWN`.
@@ -203,11 +210,10 @@ src/test/java/...        JUnit 5 suite: memtable, WAL, SSTable, bloom filter,
 
 Potential future work:
 
-- **TLS** — encrypted transport for production deployments
-- **ACL with usernames** — Redis 6+ style multi-user authentication
 - **Block-level (not per-value) compression** — better ratio for small values
-- **Replace `synchronized` with `FileChannel` + `ReentrantLock`** — eliminate virtual-thread carrier pinning during SSTable reads
-- **Replication / streaming WAL** — multi-node durability
+- **Per-user permissions** — read-only / write-only / command allowlists on top of multi-user AUTH
+- **Replication / streaming WAL** — multi-node durability via a follower protocol
+- **Sharding** — multiple nodes, hashed key range partitioning
 
 ## License
 
