@@ -85,4 +85,63 @@ class WriteAheadLogTest {
         assertNull(state.get("old"));
         assertEquals("data", state.get("new"));
     }
+
+    @Test
+    void replayStopsAtCorruptedRecord(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+
+        // Write 3 records
+        try (WriteAheadLog wal = new WriteAheadLog(log)) {
+            wal.appendPut("a", "1");
+            wal.appendPut("b", "2");
+            wal.appendPut("c", "3");
+        }
+
+        // Corrupt a byte in the middle of the file (in record 2's payload or CRC)
+        byte[] bytes = java.nio.file.Files.readAllBytes(log);
+        // Flip a byte near the middle
+        bytes[bytes.length / 2] ^= (byte) 0xff;
+        java.nio.file.Files.write(log, bytes);
+
+        Map<String, String> state = replayInto(log);
+
+        // Record 1 should have survived. Record 2 onward is gone (replay stops at first bad CRC).
+        assertEquals("1", state.get("a"));
+        assertNull(state.get("c"), "records after corruption must not be replayed");
+    }
+
+    @Test
+    void replayHandlesTruncatedTail(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+
+        // Write 3 records
+        try (WriteAheadLog wal = new WriteAheadLog(log)) {
+            wal.appendPut("first", "1");
+            wal.appendPut("second", "2");
+            wal.appendPut("third", "3");
+        }
+
+        // Truncate the file by 3 bytes (simulates a partial write / mid-record crash)
+        byte[] bytes = java.nio.file.Files.readAllBytes(log);
+        byte[] truncated = new byte[bytes.length - 3];
+        System.arraycopy(bytes, 0, truncated, 0, truncated.length);
+        java.nio.file.Files.write(log, truncated);
+
+        Map<String, String> state = replayInto(log);
+
+        // The last record's bytes are partial — replay must stop there gracefully.
+        // First two records must survive.
+        assertEquals("1", state.get("first"));
+        assertEquals("2", state.get("second"));
+        assertNull(state.get("third"));
+    }
+
+    @Test
+    void emptyLogReplayIsClean(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+        // Create an empty WAL file
+        try (WriteAheadLog wal = new WriteAheadLog(log)) {}
+        Map<String, String> state = replayInto(log);
+        assertTrue(state.isEmpty());
+    }
 }
