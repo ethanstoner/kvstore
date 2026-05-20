@@ -1,6 +1,7 @@
 package com.ethanstoner.kvstore.server;
 
 import com.ethanstoner.kvstore.KvStore;
+import com.ethanstoner.kvstore.server.UserStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -252,5 +253,58 @@ class KvServerTest {
         }
         sock.getOutputStream().write(req.toString().getBytes(StandardCharsets.UTF_8));
         sock.getOutputStream().flush();
+    }
+
+    // ── Multi-user AUTH integration test ────────────────────────────────────
+
+    @Test
+    void multiUserAuthEndToEnd(@TempDir Path dir) throws IOException {
+        UserStore users = UserStore.builder()
+                .addUser("alice", "wonderland")
+                .addUser("bob", "builder")
+                .build();
+        try (KvStore store = new KvStore(dir);
+             KvServer server = new KvServer(store, 0, users, null)) {
+            server.start();
+            int port = server.port();
+
+            // Unauth SET — blocked
+            String reply1 = roundTrip(port, new String[]{"SET", "k", "v"});
+            assertTrue(reply1.startsWith("-NOAUTH"), "Expected NOAUTH, got: " + reply1);
+
+            // Bob authenticates and writes on same socket
+            try (java.net.Socket sock = new java.net.Socket("127.0.0.1", port)) {
+                sock.setSoTimeout(3000);
+                sendResp(sock, new String[]{"AUTH", "bob", "builder"});
+                assertEquals("+OK\r\n", readOneRespReply(sock.getInputStream()));
+                sendResp(sock, new String[]{"SET", "bobkey", "bobval"});
+                assertEquals("+OK\r\n", readOneRespReply(sock.getInputStream()));
+            }
+
+            // Alice authenticates and reads bob's key on same socket
+            try (java.net.Socket sock = new java.net.Socket("127.0.0.1", port)) {
+                sock.setSoTimeout(3000);
+                sendResp(sock, new String[]{"AUTH", "alice", "wonderland"});
+                assertEquals("+OK\r\n", readOneRespReply(sock.getInputStream()));
+                sendResp(sock, new String[]{"GET", "bobkey"});
+                assertEquals("$6\r\nbobval\r\n", readOneRespReply(sock.getInputStream()));
+            }
+
+            // Wrong password for bob — WRONGPASS
+            try (java.net.Socket sock = new java.net.Socket("127.0.0.1", port)) {
+                sock.setSoTimeout(3000);
+                sendResp(sock, new String[]{"AUTH", "bob", "wrongpass"});
+                String reply = readOneRespReply(sock.getInputStream());
+                assertTrue(reply.startsWith("-WRONGPASS"), "Expected WRONGPASS, got: " + reply);
+            }
+
+            // AUTH with only password (no user) — no "default" user so WRONGPASS
+            try (java.net.Socket sock = new java.net.Socket("127.0.0.1", port)) {
+                sock.setSoTimeout(3000);
+                sendResp(sock, new String[]{"AUTH", "builder"});
+                String reply = readOneRespReply(sock.getInputStream());
+                assertTrue(reply.startsWith("-WRONGPASS"), "Expected WRONGPASS for no-default, got: " + reply);
+            }
+        }
     }
 }

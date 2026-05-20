@@ -1,6 +1,7 @@
 package com.ethanstoner.kvstore.server;
 
 import com.ethanstoner.kvstore.KvStore;
+import com.ethanstoner.kvstore.server.UserStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -241,6 +242,116 @@ class CommandHandlerTest {
             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
             authHandler.handle(new String[]{"PING"}, out, unauth);
             assertEquals("+PONG\r\n", out.toString("UTF-8"));
+        }
+    }
+
+    // ── Multi-user AUTH tests ────────────────────────────────────────────────
+
+    @Test
+    void authWithUsernameAndPasswordWorks(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            UserStore users = UserStore.builder()
+                    .addUser("alice", "wonderland")
+                    .addUser("bob", "builder")
+                    .build();
+            KvServer authServer = new KvServer(s, 0, users, null);
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+            AuthStub unauth = new AuthStub(); unauth.authed = false;
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"AUTH", "alice", "wonderland"}, out, unauth);
+            assertEquals("+OK\r\n", out.toString("UTF-8"));
+            assertTrue(unauth.authed);
+        }
+    }
+
+    @Test
+    void authWithWrongUserRejected(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            UserStore users = UserStore.builder().addUser("alice", "secret").build();
+            KvServer authServer = new KvServer(s, 0, users, null);
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+            AuthStub unauth = new AuthStub(); unauth.authed = false;
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"AUTH", "bob", "secret"}, out, unauth);
+            assertTrue(out.toString("UTF-8").startsWith("-WRONGPASS"));
+            assertFalse(unauth.authed);
+        }
+    }
+
+    @Test
+    void singlePasswordModeAcceptsBothAuthForms(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            // --requirepass mode: creates a "default" user
+            KvServer authServer = new KvServer(s, 0, "topsecret");
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+
+            // Form 1: AUTH <password>
+            AuthStub a1 = new AuthStub(); a1.authed = false;
+            java.io.ByteArrayOutputStream out1 = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"AUTH", "topsecret"}, out1, a1);
+            assertEquals("+OK\r\n", out1.toString("UTF-8"));
+
+            // Form 2: AUTH default <password>
+            AuthStub a2 = new AuthStub(); a2.authed = false;
+            java.io.ByteArrayOutputStream out2 = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"AUTH", "default", "topsecret"}, out2, a2);
+            assertEquals("+OK\r\n", out2.toString("UTF-8"));
+        }
+    }
+
+    @Test
+    void multiUserNoDefaultRejectsPasswordOnlyAuth(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            UserStore users = UserStore.builder().addUser("alice", "wonderland").build();
+            KvServer authServer = new KvServer(s, 0, users, null);
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+            AuthStub unauth = new AuthStub(); unauth.authed = false;
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            // AUTH <password> with no "default" user configured
+            authHandler.handle(new String[]{"AUTH", "wonderland"}, out, unauth);
+            assertTrue(out.toString("UTF-8").startsWith("-WRONGPASS"));
+            assertFalse(unauth.authed);
+        }
+    }
+
+    @Test
+    void authArityErrors(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            KvServer authServer = new KvServer(s, 0, "x");
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+            AuthStub unauth = new AuthStub(); unauth.authed = false;
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"AUTH"}, out, unauth);   // no args
+            assertTrue(out.toString("UTF-8").startsWith("-ERR"));
+
+            out.reset();
+            authHandler.handle(new String[]{"AUTH", "a", "b", "c"}, out, unauth);  // too many
+            assertTrue(out.toString("UTF-8").startsWith("-ERR"));
+        }
+    }
+
+    @Test
+    void wrongPasswordInSinglePasswordModeRejected(@TempDir Path dir) throws IOException {
+        try (KvStore s = new KvStore(dir)) {
+            KvServer authServer = new KvServer(s, 0, "secret");
+            CommandHandler authHandler = new CommandHandler(s, authServer);
+            AuthStub unauth = new AuthStub(); unauth.authed = false;
+
+            // AUTH default wrong — should fail
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            authHandler.handle(new String[]{"AUTH", "default", "wrong"}, out, unauth);
+            assertTrue(out.toString("UTF-8").startsWith("-WRONGPASS"));
+            assertFalse(unauth.authed);
+
+            // AUTH bob anything — no such user, should fail
+            out.reset();
+            authHandler.handle(new String[]{"AUTH", "bob", "secret"}, out, unauth);
+            assertTrue(out.toString("UTF-8").startsWith("-WRONGPASS"));
+            assertFalse(unauth.authed);
         }
     }
 }

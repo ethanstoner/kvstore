@@ -78,8 +78,8 @@ public final class CommandHandler {
         @Override public void markAuthenticated() {}
     };
 
-    private void auth(String[] args, OutputStream out, AuthState auth) throws IOException {
-        if (args.length != 2) {
+    private void auth(String[] args, OutputStream out, AuthState conn) throws IOException {
+        if (args.length < 2 || args.length > 3) {
             wrongArity(out, "AUTH");
             return;
         }
@@ -88,8 +88,20 @@ public final class CommandHandler {
                     "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
             return;
         }
-        if (server.checkPassword(args[1])) {
-            auth.markAuthenticated();
+
+        String username;
+        String password;
+        if (args.length == 2) {
+            // Implicit "default" user — backward-compatible single-password mode
+            username = "default";
+            password = args[1];
+        } else {
+            username = args[1];
+            password = args[2];
+        }
+
+        if (server.checkAuth(username, password)) {
+            conn.markAuthenticated();
             RespWriter.writeSimpleString(out, "OK");
         } else {
             RespWriter.writeError(out,

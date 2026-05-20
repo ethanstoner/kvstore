@@ -96,7 +96,7 @@ class TlsTest {
         Path keystore = createTempKeystore(dir, pass);
 
         try (KvStore store = new KvStore(dir.resolve("data"));
-             KvServer server = new KvServer(store, 0, null,
+             KvServer server = new KvServer(store, 0, UserStore.empty(),
                      TlsConfig.fromKeystore(keystore, pass))) {
             server.start();
             int port = server.port();
@@ -132,7 +132,7 @@ class TlsTest {
         Path keystore = createTempKeystore(dir, pass);
 
         try (KvStore store = new KvStore(dir.resolve("data2"));
-             KvServer server = new KvServer(store, 0, null,
+             KvServer server = new KvServer(store, 0, UserStore.empty(),
                      TlsConfig.fromKeystore(keystore, pass))) {
             server.start();
             int port = server.port();
