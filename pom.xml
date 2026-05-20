@@ -54,7 +54,7 @@
         <configuration>
           <archive>
             <manifest>
-              <mainClass>com.ethanstoner.kvstore.cli.Main</mainClass>
+              <mainClass>com.ethanstoner.kvstore.cli.Cli</mainClass>
             </manifest>
           </archive>
         </configuration>
