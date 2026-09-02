@@ -423,6 +423,34 @@ class CommandHandlerTest {
     }
 
     @Test
+    void setexStoresValueWithTtl() throws IOException {
+        assertEquals("+OK\r\n", run("SETEX", "k", "60", "v"));
+        assertEquals("$1\r\nv\r\n", run("GET", "k"));
+        String ttlReply = run("TTL", "k");
+        int seconds = Integer.parseInt(ttlReply.substring(1, ttlReply.indexOf("\r")));
+        assertTrue(seconds > 0 && seconds <= 60, "TTL out of range: " + seconds);
+    }
+
+    @Test
+    void psetexStoresValueWithMillisTtl() throws IOException {
+        assertEquals("+OK\r\n", run("PSETEX", "k", "60000", "v"));
+        assertEquals("$1\r\nv\r\n", run("GET", "k"));
+        String reply = run("PTTL", "k");
+        long ms = Long.parseLong(reply.substring(1, reply.indexOf("\r")));
+        assertTrue(ms > 0 && ms <= 60000, "PTTL out of range: " + ms);
+    }
+
+    @Test
+    void setexRejectsNonPositiveExpiry() throws IOException {
+        assertTrue(run("SETEX", "k", "0", "v").startsWith("-ERR invalid expire time"));
+    }
+
+    @Test
+    void setexRejectsWrongArity() throws IOException {
+        assertTrue(run("SETEX", "k", "60").startsWith("-ERR wrong number of arguments"));
+    }
+
+    @Test
     void expireCommandWorks() throws IOException {
         run("SET", "k", "v");
         assertEquals(":1\r\n", run("EXPIRE", "k", "60"));
@@ -482,6 +510,17 @@ class CommandHandlerTest {
         run("SET", "a", "1");
         String reply = run("BGSAVE");
         assertEquals("+Background saving started\r\n", reply);
+    }
+
+    @Test
+    void bgsaveAcceptsScheduleFlag() throws IOException {
+        run("SET", "a", "1");
+        assertEquals("+Background saving started\r\n", run("BGSAVE", "SCHEDULE"));
+    }
+
+    @Test
+    void bgsaveRejectsUnknownFlag() throws IOException {
+        assertEquals("-ERR syntax error\r\n", run("BGSAVE", "NOPE"));
     }
 
     @Test

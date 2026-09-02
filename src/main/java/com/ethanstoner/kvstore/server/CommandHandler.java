@@ -85,6 +85,8 @@ public final class CommandHandler {
                 case "AUTH"     -> auth(args, out, auth);
                 case "PING"     -> ping(args, out);
                 case "SET"      -> set(args, out);
+                case "SETEX"    -> setex(args, out, false);
+                case "PSETEX"   -> setex(args, out, true);
                 case "GET"      -> get(args, out);
                 case "DEL"      -> del(args, out);
                 case "EXISTS"   -> exists(args, out);
@@ -185,6 +187,25 @@ public final class CommandHandler {
             }
         }
         store.put(args[1], args[2], expiresAtMs);
+        RespWriter.writeSimpleString(out, "OK");
+    }
+
+    /** {@code SETEX key seconds value} / {@code PSETEX key milliseconds value}. */
+    private void setex(String[] args, OutputStream out, boolean millis) throws IOException {
+        String name = millis ? "PSETEX" : "SETEX";
+        if (args.length != 4) { wrongArity(out, name); return; }
+        long n;
+        try { n = Long.parseLong(args[2]); }
+        catch (NumberFormatException e) {
+            RespWriter.writeError(out, "ERR value is not an integer or out of range");
+            return;
+        }
+        if (n <= 0) {
+            RespWriter.writeError(out, "ERR invalid expire time in '"
+                    + name.toLowerCase(Locale.ROOT) + "' command");
+            return;
+        }
+        store.put(args[1], args[3], System.currentTimeMillis() + (millis ? n : n * 1000L));
         RespWriter.writeSimpleString(out, "OK");
     }
 
@@ -402,7 +423,12 @@ public final class CommandHandler {
     }
 
     private void bgsave(String[] args, OutputStream out) throws IOException {
-        if (args.length != 1) { wrongArity(out, "BGSAVE"); return; }
+        if (args.length > 2) { wrongArity(out, "BGSAVE"); return; }
+        // Redis accepts an optional SCHEDULE flag; snapshots here are always backgrounded.
+        if (args.length == 2 && !args[1].equalsIgnoreCase("SCHEDULE")) {
+            RespWriter.writeError(out, "ERR syntax error");
+            return;
+        }
         store.bgsnapshot();
         RespWriter.writeSimpleString(out, "Background saving started");
     }
