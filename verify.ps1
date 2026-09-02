@@ -1,4 +1,4 @@
-# verify.ps1 — end-to-end verification that kvstore actually works.
+﻿# verify.ps1 — end-to-end verification that kvstore actually works.
 #
 # Runs three checks beyond the unit-test suite:
 #   1. Live RESP smoke test against a real TCP server (17 commands)
@@ -11,10 +11,36 @@
 
 param([switch]$SkipBench)
 
-$env:JAVA_HOME = "C:\Program Files\Microsoft\jdk-21.0.11.10-hotspot"
-$env:PATH = "$env:JAVA_HOME\bin;$env:USERPROFILE\tools\maven\apache-maven-3.9.16\bin;$env:PATH"
+# Prefers whatever `java` and `mvn` are already on PATH (JDK 21+ and Maven, per the
+# README), falling back to the usual Windows install locations so a machine that has
+# them installed but not on PATH still runs.
+if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
+    $jdk = Get-ChildItem "$env:ProgramFiles\Microsoft\jdk-21*" -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if ($jdk) { $env:JAVA_HOME = $jdk.FullName; $env:PATH = "$($jdk.FullName)\bin;$env:PATH" }
+}
+if (-not (Get-Command mvn -ErrorAction SilentlyContinue)) {
+    $m2 = Get-ChildItem "$env:USERPROFILE\tools\maven\apache-maven-*\bin" -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if ($m2) { $env:PATH = "$($m2.FullName);$env:PATH" }
+}
+foreach ($tool in 'java', 'mvn') {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+        Write-Error "$tool was not found. Install JDK 21+ and Maven, or add them to PATH."
+        exit 1
+    }
+}
 
 Set-Location $PSScriptRoot
+
+# Stops only the servers this script started. Matching on the jar name matters: a
+# bare `Get-Process java | Stop-Process` kills every JVM on the machine, including
+# unrelated work that happens to be running.
+function Stop-KvServers {
+    Get-CimInstance Win32_Process -Filter "Name = 'java.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*kvstore*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
 
 function MkResp { param([string[]]$Parts)
     $sb = New-Object System.Text.StringBuilder
@@ -58,7 +84,7 @@ Write-Output "Built target/kvstore-0.1.0.jar"
 Write-Output ""
 Write-Output "=== 1. Live RESP smoke test ==="
 
-Get-Process java -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Stop-KvServers
 Start-Sleep -Seconds 1
 if (Test-Path verify-data) { Remove-Item -Recurse -Force verify-data -ErrorAction SilentlyContinue }
 
@@ -155,7 +181,7 @@ if (-not $SkipBench) {
 
 # ----------------------------------------------------------------------------
 # Cleanup
-Get-Process java -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Stop-KvServers
 Start-Sleep -Seconds 1
 if (Test-Path verify-data) { Remove-Item -Recurse -Force verify-data -ErrorAction SilentlyContinue }
 Remove-Item verify-srv.log,verify-srv.err.log -ErrorAction SilentlyContinue
