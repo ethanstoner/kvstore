@@ -66,11 +66,13 @@ public final class Main {
 
     private static void usage() {
         System.out.println("""
-                kvstore — commands:
-                  put  <key> <value>
-                  get  <key>
-                  del  <key>
-                  scan <fromInclusive> <toExclusive>
+                kvstore - commands:
+                  put   <key> <value>
+                  get   <key>
+                  del   <key>
+                  scan  <fromInclusive> <toExclusive>
+                  serve [--port PORT] [--data DIR] ...   start the Redis-compatible server
+                                                         (run `serve --help` for all flags)
                 """);
     }
 }
