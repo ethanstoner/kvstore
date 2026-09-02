@@ -2,7 +2,7 @@
 
 A persistent, Redis-compatible key-value database I wrote from scratch in Java 21. The storage layer is an LSM-tree of the same shape as LevelDB and RocksDB: write-ahead log, in-memory memtable, sorted on-disk SSTables, leveled compaction. The network layer is a TCP server speaking the Redis RESP protocol, so existing Redis clients like `redis-cli`, `redis-py`, and `Jedis` work without modification.
 
-[![CI](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml) &nbsp; 203 tests · ~5,200 lines of Java · MIT
+[![CI](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml) &nbsp; 209 tests · ~5,200 lines of Java · MIT
 
 ```bash
 $ java -jar kvstore.jar serve --port 6379
@@ -37,13 +37,19 @@ Stores key-value pairs durably and serves them over the network. The pieces:
 Full command surface:
 
 ```
-Keys/strings:  SET (with EX/PX) · GET · DEL · EXISTS · MGET · MSET · SCAN
+Keys/strings:  SET (with EX/PX) · SETEX · PSETEX · GET · DEL · EXISTS · MGET · MSET · SCAN
 Numeric:       INCR · DECR · INCRBY · DECRBY
 TTL:           EXPIRE · PEXPIRE · TTL · PTTL · PERSIST
 Pub/Sub:       SUBSCRIBE · UNSUBSCRIBE · PSUBSCRIBE · PUNSUBSCRIBE · PUBLISH
 Snapshots:     SAVE · BGSAVE · LASTSAVE
 Server:        AUTH · PING · DBSIZE · INFO · COMMAND · QUIT · SHUTDOWN
 ```
+
+Two deliberate deviations from Redis, both of which report a clear error rather than
+misbehaving: the wire protocol is RESP2 only (no `HELLO`/RESP3 handshake — clients
+negotiate down automatically), and `SCAN` is a range scan, `SCAN <from> <to>`, rather
+than Redis's cursor-based iteration. Anything outside the list above is answered with
+`ERR unknown command`.
 
 ## Performance
 
@@ -92,8 +98,6 @@ Every write is logged to disk before it is applied in memory; that ordering is w
 
 Reads check the active memtable, then the immutable memtable (if a flush is in progress), then SSTables newest-first. Each SSTable's bloom filter is consulted first; if it says the key can't be present, we skip the file's index and disk seek entirely.
 
-A more detailed diagram of the storage layout — L0 fan-in, level fanout, what's inside each SSTable file — is below in the design notes section.
-
 ## Design notes
 
 A few of the more interesting decisions and the reasoning that drove them.
@@ -127,7 +131,7 @@ Values larger than 64 bytes get Deflate-compressed before writing to the SSTable
 Requires JDK 21 or newer and Maven.
 
 ```bash
-mvn verify                            # compile and run the 203-test suite
+mvn verify                            # compile and run the 209-test suite
 mvn package                           # produces target/kvstore-0.1.0.jar
 java -jar target/kvstore-0.1.0.jar serve
 ```
@@ -186,7 +190,7 @@ src/main/java/com/ethanstoner/kvstore/
   benchmark/
     KvStoreBenchmark                                            JMH
 
-src/test/java/...     18 test classes, 203 tests
+src/test/java/...     18 test classes, 209 tests
 .github/workflows/    CI runs mvn verify on every push
 Dockerfile            multi-stage build
 verify.ps1            end-to-end verification script
