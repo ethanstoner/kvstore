@@ -4,6 +4,7 @@ kvdata/
 .idea/
 *.iml
 .vscode/
+.claude/
 .DS_Store
 docs/plans/
 docs/specs/

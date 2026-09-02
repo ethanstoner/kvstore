@@ -1,8 +1,6 @@
 name: CI
 
 # Runs the full build + test suite on every push and pull request.
-# A green check here is the single strongest "this is real engineering"
-# signal a recruiter sees on the repo page.
 on:
   push:
     branches: [ main ]
