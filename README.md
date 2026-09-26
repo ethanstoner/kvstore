@@ -1,8 +1,8 @@
 # kvstore
 
-A persistent, Redis-compatible key-value database I wrote from scratch in Java 21. The storage layer is an LSM-tree of the same shape as LevelDB and RocksDB: write-ahead log, in-memory memtable, sorted on-disk SSTables, leveled compaction. The network layer is a TCP server speaking the Redis RESP protocol, so existing Redis clients like `redis-cli`, `redis-py`, and `Jedis` work without modification.
+A persistent, Redis-compatible key-value database written from scratch in Java 21: an LSM-tree storage engine (the LevelDB/RocksDB design) behind a TCP server that speaks the Redis RESP protocol, so `redis-cli`, `redis-py` and Jedis connect without modification.
 
-[![CI](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml) &nbsp; 209 tests · ~5,200 lines of Java · MIT
+[![CI](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/ethanstoner/kvstore/actions/workflows/ci.yml) [![Java 21](https://img.shields.io/badge/Java-21-orange)](https://openjdk.org/projects/jdk/21/) [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
 ```bash
 $ java -jar kvstore.jar serve --port 6379
@@ -18,52 +18,18 @@ $ redis-cli -p 6379 ttl session:abc
 (integer) 58
 ```
 
-## Why I built it
+### Highlights
 
-Most engineers treat databases as black boxes: call `SET`, get back a response. I wanted to build one to understand what they hide. How does a WAL keep writes durable across crashes? How are SSTables merged without blocking reads? How does a bloom filter avoid disk seeks for keys that don't exist? How do Java 21 virtual threads change the calculus of network I/O?
+- ~130K point reads/s and ~100K writes/s single-threaded on a 100K-key dataset (JMH)
+- Missing-key lookups run at ~11.8M ops/s, about 90x faster than existing-key reads, because per-file bloom filters skip the disk entirely
+- Recovers from `kill -9`: an end-to-end test writes 5,000 keys over TCP, kills the server, restarts it, and reads the first, middle and last keys back from the write-ahead log
+- 209 JUnit tests across 18 test classes, run in CI on every push
 
-The public API of a key-value store is tiny. Everything interesting is in the internals, and the internals are the canonical CS fundamentals — balanced/sorted structures, binary search, merge algorithms, file I/O, concurrency, crash recovery, a real wire protocol.
+**Java 21 · virtual threads · Maven · JUnit 5 · JMH · Docker · GitHub Actions**
 
-## What it does
+## Overview
 
-Stores key-value pairs durably and serves them over the network. The pieces:
-
-- **Storage** — LSM-tree with a write-ahead log (CRC32 per record), an in-memory sorted memtable, and on-disk SSTables organized into levels (L0 through L_n, each ten times larger than the previous). Background threads handle flush and compaction without stalling writes.
-- **Performance** — per-file bloom filters skip irrelevant SSTables; an LRU value cache is shared across all files; values larger than 64 bytes get Deflate-compressed.
-- **Network** — TCP server on Java 21 virtual threads (one per connection). Speaks the RESP protocol, so any Redis client connects.
-- **Security** — optional TLSv1.3, multi-user authentication with constant-time password comparison, per-user command ACLs.
-- **Features** — TTL (`SET ... EX`, `EXPIRE`, `PERSIST`), atomic counters (`INCR`, `DECR`), pub/sub with glob-pattern matching, point-in-time snapshots (`BGSAVE`), range scans, an `INFO` endpoint with cache and storage stats, configurable connection limits.
-
-Full command surface:
-
-```
-Keys/strings:  SET (with EX/PX) · SETEX · PSETEX · GET · DEL · EXISTS · MGET · MSET · SCAN
-Numeric:       INCR · DECR · INCRBY · DECRBY
-TTL:           EXPIRE · PEXPIRE · TTL · PTTL · PERSIST
-Pub/Sub:       SUBSCRIBE · UNSUBSCRIBE · PSUBSCRIBE · PUNSUBSCRIBE · PUBLISH
-Snapshots:     SAVE · BGSAVE · LASTSAVE
-Server:        AUTH · PING · DBSIZE · INFO · COMMAND · QUIT · SHUTDOWN
-```
-
-Two deliberate deviations from Redis, both of which report a clear error rather than
-misbehaving: the wire protocol is RESP2 only (no `HELLO`/RESP3 handshake — clients
-negotiate down automatically), and `SCAN` is a range scan, `SCAN <from> <to>`, rather
-than Redis's cursor-based iteration. Anything outside the list above is answered with
-`ERR unknown command`.
-
-## Performance
-
-Single-threaded JMH on JDK 21 (Microsoft OpenJDK 21.0.11), 100K-key dataset:
-
-| Workload | Throughput |
-|---|---|
-| Sequential write | ~100K ops/sec |
-| Random write | ~106K ops/sec |
-| Point read, existing key | ~131K ops/sec |
-| Point read, missing key | ~14M ops/sec |
-| Range scan, 100 keys per scan | ~165K keys/sec |
-
-The huge gap between existing and missing key reads is the bloom filter: when it correctly tells us a level can't contain a key, we skip the disk seek entirely. Reproduce locally with `java -jar target/kvstore-0.1.0-benchmarks.jar`.
+The public API of a key-value store is tiny; everything interesting is in the internals. I built this to understand what databases hide: how a WAL keeps writes durable across crashes, how SSTables are merged without blocking reads, how a bloom filter avoids disk seeks for keys that don't exist, and how Java 21 virtual threads change network I/O. It is about 3,800 lines of Java, plus 3,300 lines of tests.
 
 ## Architecture
 
@@ -94,44 +60,58 @@ The huge gap between existing and missing key reads is the bloom filter: when it
   └────────────────────────────────────────────────────────────┘
 ```
 
-Every write is logged to disk before it is applied in memory; that ordering is what makes a crash survivable. When the memtable exceeds 4 MB it is atomically swapped to an immutable slot and a background thread writes it to an L0 SSTable. New writes continue against a fresh memtable without blocking. A separate background thread compacts L_n into L_n+1, dropping tombstones only when they reach the deepest level.
+**Writes** are appended to the WAL (CRC32 per record) before they touch memory, which is what makes a crash survivable. When the memtable passes 4 MB it is swapped into an immutable slot and a background thread writes it out as an L0 SSTable while new writes continue against a fresh memtable. A second background thread compacts L_n into L_n+1 (each level 10x the size of the one above) and drops tombstones only at the deepest level.
 
-Reads check the active memtable, then the immutable memtable (if a flush is in progress), then SSTables newest-first. Each SSTable's bloom filter is consulted first; if it says the key can't be present, we skip the file's index and disk seek entirely.
+**Reads** check the active memtable, then the immutable memtable, then SSTables newest-first. Each SSTable's bloom filter is consulted before its index; a negative answer skips the file.
+
+## Engineering Highlights
+
+- **Designed** an LSM-tree storage engine end to end: write-ahead log with per-record CRC32 checksums, a `ConcurrentSkipListMap` memtable, an on-disk SSTable format with a per-key offset index and a MurmurHash3 bloom filter per file.
+- **Replaced** size-tiered compaction with leveled compaction (LevelDB-style): L0 compacts once it holds 4 files, and L1 and below hold non-overlapping key ranges, so a read touches at most one file per level.
+- **Moved flush off the write path** with an immutable-memtable swap and a two-WAL scheme (`wal.log` + `wal-pending.log`); recovery replays both, so no acknowledged write is lost at any point in the flush lifecycle.
+- **Removed virtual-thread carrier pinning** on the read path by migrating SSTable reads from `RandomAccessFile` + `synchronized` to stateless `FileChannel` positional reads.
+- **Implemented** a RESP2 server on Java 21 virtual threads (one per connection) covering 33 Redis commands, including TTLs, atomic counters, pub/sub with glob patterns and `BGSAVE` snapshots.
+- **Secured** the server with optional TLSv1.3, multi-user `AUTH` with constant-time password comparison (`MessageDigest.isEqual`), and per-user command allowlists.
+- **Measured** throughput with JMH (table below) and wrote an end-to-end script that exercises the real server over TCP, including a `kill -9` crash-recovery check.
+
+## Performance
+
+JMH 1.37, single-threaded, Microsoft OpenJDK 21.0.11, 100K-key dataset:
+
+| Workload | Throughput |
+|---|---|
+| Sequential write | ~102.5K ops/s |
+| Random write | ~105.9K ops/s |
+| Point read, existing key | ~129.3K ops/s |
+| Point read, missing key | ~11.76M ops/s |
+| Range scan, 100 keys per scan | ~1,685 scans/s (~168K keys/s) |
+
+The gap between existing- and missing-key reads is the bloom filter: when it says a file can't hold the key, the index lookup and disk seek are skipped. Reproduce with `java -jar target/kvstore-0.1.0-benchmarks.jar`.
+
+## Commands
+
+```
+Keys/strings:  SET (with EX/PX) · SETEX · PSETEX · GET · DEL · EXISTS · MGET · MSET · SCAN
+Numeric:       INCR · DECR · INCRBY · DECRBY
+TTL:           EXPIRE · PEXPIRE · TTL · PTTL · PERSIST
+Pub/Sub:       SUBSCRIBE · UNSUBSCRIBE · PSUBSCRIBE · PUNSUBSCRIBE · PUBLISH
+Snapshots:     SAVE · BGSAVE · LASTSAVE
+Server:        AUTH · PING · DBSIZE · INFO · COMMAND · QUIT · SHUTDOWN
+```
+
+Two deliberate deviations from Redis, both reported as a clear error rather than misbehaving: the wire protocol is RESP2 only (no `HELLO`/RESP3 handshake; clients negotiate down automatically), and `SCAN` is a range scan, `SCAN <from> <to>`, rather than cursor-based iteration. Anything outside the list above gets `ERR unknown command`.
 
 ## Design notes
 
-A few of the more interesting decisions and the reasoning that drove them.
+**Per-value compression with a fallback.** Values over 64 bytes are Deflate-compressed; if the output isn't smaller (random or already-compressed data), the original bytes are stored. A per-entry op byte tells the reader which path to take, so adding compression needed no file-format version bump. The block cache holds decompressed values, so a cache hit skips both the seek and the inflate.
 
-### Leveled compaction, not size-tiered
+**Snapshots reuse the SSTable format.** `BGSAVE` writes the merged view of every level (newest value wins, tombstones and expired entries dropped) as a single valid SSTable. There is no special restore path: stop the server, rename `snapshot-N.db` to `L0-NNNNNN.db`, and restart.
 
-The first version of compaction was size-tiered: group SSTables by order-of-magnitude file size, merge when four or more of similar size accumulate. Simpler to implement, but it has a real cost — any given key can live in any SSTable, so reads have to consult all of them (bloom filters help, but they're probabilistic).
+## Getting Started
 
-Switching to leveled compaction (the LevelDB and RocksDB approach) caps L0 at four files and gives L1 and below non-overlapping key ranges. Each read touches at most one file per level, with bloom filters short-circuiting further. Compaction itself does more total work, but reads become predictable and space amplification drops.
-
-### Concurrent flush
-
-The naive memtable flush blocks writes for 10–50 ms on commodity SSDs. The version in the repo does an atomic swap that moves the full memtable into an "immutable" slot in microseconds, then lets a background thread write the SSTable. New writes continue against a fresh memtable immediately.
-
-Crash safety is preserved by a second WAL file (`wal-pending.log`) holding the in-flight memtable's records until the corresponding SSTable lands on disk. On startup, the recovery code replays the pending WAL first, then the active WAL. Both either fully exist or don't, so there's no torn state to resolve.
-
-### `FileChannel` instead of `RandomAccessFile`
-
-`RandomAccessFile` keeps an implicit cursor, so concurrent seeks require a `synchronized` block. In Java 21, `synchronized` blocks pin the virtual thread's carrier — which defeats the whole reason for using virtual threads in the network layer. `FileChannel.read(ByteBuffer, position)` is stateless: it takes the offset as an argument, so it's safe to call from many threads in parallel without any locking.
-
-### Per-value compression with a fallback
-
-Values larger than 64 bytes get Deflate-compressed before writing to the SSTable. If the compressed output isn't actually smaller (e.g. random or already-compressed data), the original bytes get stored instead. A per-entry op byte tells the reader which path to take, so no file-format version bump was needed when this was added. The block cache stores decompressed values, so cache hits skip both the disk seek and the inflate step.
-
-### Snapshots reuse the SSTable format
-
-`BGSAVE` writes a single file containing the merged view of every level — newest values win for duplicate keys, tombstones and expired entries are dropped. That file is just a valid SSTable. There's no special restore code path: stop the server, rename `snapshot-N.db` to `L0-NNNNNN.db`, and restart. It loads as if it were any other SSTable.
-
-## Build and run
-
-Requires JDK 21 or newer and Maven.
+Requires JDK 21+ and Maven.
 
 ```bash
-mvn verify                            # compile and run the 209-test suite
 mvn package                           # produces target/kvstore-0.1.0.jar
 java -jar target/kvstore-0.1.0.jar serve
 ```
@@ -167,11 +147,16 @@ docker build -t kvstore .
 docker run -d -p 6379:6379 -v kvdata:/data kvstore
 ```
 
-## Verification
+## Testing
 
-Beyond the unit suite, `verify.ps1` runs an end-to-end check: it starts the server, issues a RESP smoke test of 17 commands over a real TCP socket, kills the server with `kill -9` mid-write, restarts it, and confirms all 5,000 pre-crash writes survived. It also runs the JMH benchmarks. CI runs `mvn verify` on every push.
+```bash
+mvn verify          # 209 tests in 18 classes; CI runs this on every push
+./verify.ps1        # end-to-end checks against a real server
+```
 
-## Code layout
+The unit suite covers the WAL, memtable, SSTable format, bloom filter, block cache, compression, leveled compaction, concurrent flush, TTLs, snapshots, the RESP codec, the server, pub/sub, auth and TLS. `verify.ps1` starts the server and sends a 17-command RESP smoke test over a real TCP socket, then writes 5,000 keys, kills the server with `kill -9`, restarts it and spot-checks the first, middle and last keys. It also runs the JMH benchmarks (skip with `-SkipBench`).
+
+## Project Structure
 
 ```
 src/main/java/com/ethanstoner/kvstore/
@@ -189,21 +174,14 @@ src/main/java/com/ethanstoner/kvstore/
     Cli, Main, ServeCommand                                     one-shot CLI + server entry point
   benchmark/
     KvStoreBenchmark                                            JMH
-
-src/test/java/...     18 test classes, 209 tests
-.github/workflows/    CI runs mvn verify on every push
-Dockerfile            multi-stage build
-verify.ps1            end-to-end verification script
 ```
 
-## Not in here
+## What I Learned
 
-Things I'd build next if I were taking this further:
-
-- **Replication.** Master/replica streaming WAL. An MVP — async-only, manual failover — is about a week of focused work. Full automatic failover is multi-week and crosses into distributed consensus territory.
-- **Sharding.** Multi-node, key-range or hash-based partitioning.
-- **Block-level compression.** Per-value compression already runs; grouping small values into compressed blocks would compress better at the cost of file-format complexity.
+- **Simple compaction has a read cost.** Size-tiered compaction was easier to write, but any key could live in any SSTable, so every read had to consult every file. Leveled compaction does more total merge work in exchange for bounded, predictable reads.
+- **`synchronized` and virtual threads don't mix.** `RandomAccessFile` keeps an implicit cursor, so concurrent reads needed a lock, and on Java 21 a `synchronized` block pins the virtual thread to its carrier, undoing the point of using virtual threads. Positional `FileChannel` reads take the offset as an argument and need no lock.
+- **Background work complicates shutdown.** Adding `BGSAVE` introduced a deadlock in `close()` until the snapshot executor was drained before taking the flush lock; every new background thread needs a defined place in the shutdown order.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE)
